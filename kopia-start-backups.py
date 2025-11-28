@@ -429,8 +429,8 @@ def main():
             logging.error(f"No matching repositories found for: {args.repo}")
             sys.exit(1)
 
-    # Perform pre-flight checks (unless skipped or just registering)
-    if not args.skip_preflight and not args.register:
+    # Perform pre-flight checks (unless skipped, registering, or scheduled mode)
+    if not args.skip_preflight and not args.register and not args.scheduled:
         preflight_ok, preflight_errors = preflight_checks(config, runner)
         if not preflight_ok:
             print("\n" + "="*60, file=sys.stderr)

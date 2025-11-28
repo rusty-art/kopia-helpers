@@ -784,11 +784,14 @@ class RcloneRunner:
             True if remote is configured, False otherwise.
         """
         try:
+            # CREATE_NO_WINDOW prevents console popup on Windows during scheduled runs
+            creation_flags = 0x08000000 if sys.platform == "win32" else 0
             result = subprocess.run(
                 [RCLONE_EXE, "listremotes"],
                 capture_output=True,
                 text=True,
-                encoding='utf-8'
+                encoding='utf-8',
+                creationflags=creation_flags
             )
             if result.returncode != 0:
                 return False

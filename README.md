@@ -1,5 +1,7 @@
 # Kopia Backup Scripts
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Multi-repository backup automation for [Kopia](https://kopia.io/).**
 
 > Currently Windows only, but could be adapted for Linux/macOS.
@@ -120,3 +122,7 @@ All scripts support:
 - Python 3.8+
 - PyYAML: `pip install pyyaml`
 - python-dotenv (optional): `pip install python-dotenv`
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.

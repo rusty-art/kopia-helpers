@@ -277,14 +277,56 @@ def check_all_repositories(
     return is_healthy, most_recent_backup, stale_repos
 
 
-def show_detailed_status(runner: utils.KopiaRunner, repo_config: Dict[str, Any], zulu: bool, last: int, max_files: int):
-    """Show detailed snapshot history for a repository (replacing kopia-check-backups.py)."""
+def get_repository_size(runner: utils.KopiaRunner, repo_config: Dict[str, Any]) -> Optional[int]:
+    """Get total repository disk size in bytes using blob stats --raw."""
+    config_file = repo_config['config_file_path']
+
+    success, stdout, stderr, _ = runner.run(
+        ["blob", "stats", "--config-file", config_file, "--raw"],
+        repo_config=repo_config, readonly=True
+    )
+
+    if not success:
+        return None
+
+    # Parse "Total: 613154858" from --raw output
+    for line in stdout.splitlines():
+        if line.startswith("Total:"):
+            try:
+                return int(line.split(":")[1].strip())
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
+def format_size(size_bytes: int) -> str:
+    """Format size in bytes to human readable string."""
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024*1024*1024):.2f} GB"
+    elif size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024*1024):.2f} MB"
+    elif size_bytes >= 1024:
+        return f"{size_bytes / 1024:.2f} KB"
+    else:
+        return f"{size_bytes} B"
+
+
+def show_detailed_status(runner: utils.KopiaRunner, repo_config: Dict[str, Any], zulu: bool, last: int, max_files: int) -> Optional[int]:
+    """Show detailed snapshot history for a repository (replacing kopia-check-backups.py).
+
+    Returns the repository disk size in bytes, or None if unavailable.
+    """
     name = repo_config['name']
     config_file = repo_config['config_file_path']
     repo_path = repo_config['repository_path']
 
     print(f"\n{'='*20} {name} {'='*20}")
     print(f"Repository Path: {repo_path}")
+
+    # Get and display repository disk size
+    repo_size = get_repository_size(runner, repo_config)
+    if repo_size is not None:
+        print(f"Repository Disk Usage: {format_size(repo_size)}")
     print("Latest Snapshots:")
     
     success, stdout, stderr, _ = runner.run(
@@ -423,6 +465,8 @@ def show_detailed_status(runner: utils.KopiaRunner, repo_config: Dict[str, Any],
     except json.JSONDecodeError:
         print("  Could not parse snapshot list.")
         print(stdout)
+
+    return repo_size
 
 
 def show_toast_notification(title: str, message: str):
@@ -580,9 +624,23 @@ Examples:
         repos = config['repositories']
         if repo_filter:
             repos = [r for r in repos if r['name'] in repo_filter]
-        
+
+        repo_sizes = []
         for repo in repos:
-            show_detailed_status(runner, repo, zulu=args.zulu, last=args.last, max_files=args.max_files)
+            size = show_detailed_status(runner, repo, zulu=args.zulu, last=args.last, max_files=args.max_files)
+            if size is not None:
+                repo_sizes.append((repo['name'], size))
+
+        # Print summary if multiple repos or at least one repo has size info
+        if repo_sizes:
+            print(f"\n{'='*20} Summary Disk Usage {'='*20}")
+            total_size = 0
+            for name, size in repo_sizes:
+                print(f"  {name}: {format_size(size)}")
+                total_size += size
+            if len(repo_sizes) > 1:
+                print(f"  {'-'*30}")
+                print(f"  Total: {format_size(total_size)}")
         return
 
     # Parse repo filter

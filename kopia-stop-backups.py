@@ -11,11 +11,18 @@ Usage:
 
 Requires:
     - Admin rights to modify Task Scheduler
+    - Windows OS (uses schtasks)
 """
 import sys
 import argparse
 import subprocess
 import kopia_utils as utils
+
+# Exit codes
+EXIT_SUCCESS = 0
+EXIT_NOT_ADMIN = 1
+EXIT_TASK_ERROR = 2
+EXIT_NOT_WINDOWS = 3
 
 BACKUP_TASK_NAME = "KopiaHelperBackup"
 HEALTH_TASK_NAME = "KopiaHelperHealth"
@@ -82,11 +89,17 @@ Examples:
     unregister_backups = args.backups or (not args.backups and not args.health)
     unregister_health = args.health or (not args.backups and not args.health)
 
+    # Check Windows platform
+    if sys.platform != "win32":
+        print("This script is only supported on Windows.")
+        print("On other platforms, use your system's cron or systemd to manage scheduled tasks.")
+        sys.exit(EXIT_NOT_WINDOWS)
+
     # Check admin up-front before doing any work
     if not utils.is_admin():
         print("Administrator privileges required to modify Task Scheduler.")
         print("Please re-run as Administrator.")
-        sys.exit(1)
+        sys.exit(EXIT_NOT_ADMIN)
 
     success = True
 
@@ -101,9 +114,10 @@ Examples:
     if success:
         print("\nScheduled tasks unregistered. Backups will no longer run automatically.")
         print("To re-enable, run: python kopia-start-backups.py")
+        sys.exit(EXIT_SUCCESS)
     else:
         print("\nSome tasks could not be unregistered.")
-        sys.exit(1)
+        sys.exit(EXIT_TASK_ERROR)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,192 @@ CONFIG_FILE = os.path.join(SCRIPT_DIR, "kopia-configs.yaml")
 STATUS_FILE = os.path.join(Path.home(), ".kopia-status.json")
 
 
+def check_tool_available(tool_name: str) -> Tuple[bool, str]:
+    """Check if an external tool is available in PATH.
+
+    Args:
+        tool_name: Name of the executable to check (e.g., 'kopia', 'rclone')
+
+    Returns:
+        Tuple of (is_available, version_or_error_message)
+    """
+    try:
+        # Use 'where' on Windows, 'which' on Unix
+        if sys.platform == "win32":
+            result = subprocess.run(
+                ["where", tool_name],
+                capture_output=True,
+                text=True,
+                creationflags=0x08000000  # CREATE_NO_WINDOW
+            )
+        else:
+            result = subprocess.run(
+                ["which", tool_name],
+                capture_output=True,
+                text=True
+            )
+
+        if result.returncode != 0:
+            return False, f"'{tool_name}' not found in PATH"
+
+        # Try to get version
+        try:
+            version_result = subprocess.run(
+                [tool_name, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=0x08000000 if sys.platform == "win32" else 0
+            )
+            version = version_result.stdout.strip().split('\n')[0] if version_result.stdout else "unknown version"
+            return True, version
+        except Exception:
+            return True, "version unknown"
+
+    except FileNotFoundError:
+        return False, f"'{tool_name}' not found in PATH"
+    except Exception as e:
+        return False, str(e)
+
+
+def get_kopia_install_instructions() -> str:
+    """Get installation instructions for Kopia."""
+    if sys.platform == "win32":
+        return """
+Kopia is not installed or not in PATH.
+
+Installation options:
+  1. Winget (recommended):
+     winget install kopia
+
+  2. Scoop:
+     scoop bucket add extras
+     scoop install kopia
+
+  3. Manual download:
+     https://github.com/kopia/kopia/releases
+     Download kopia-X.X.X-windows-x64.zip, extract, add to PATH
+
+After installation, verify with: kopia --version
+"""
+    elif sys.platform == "darwin":
+        return """
+Kopia is not installed or not in PATH.
+
+Installation options:
+  1. Homebrew (recommended):
+     brew install kopia
+
+  2. Manual download:
+     https://github.com/kopia/kopia/releases
+
+After installation, verify with: kopia --version
+"""
+    else:
+        return """
+Kopia is not installed or not in PATH.
+
+Installation options:
+  1. Package manager (Debian/Ubuntu):
+     curl -s https://kopia.io/signing-key | sudo gpg --dearmor -o /etc/apt/keyrings/kopia-keyring.gpg
+     echo "deb [signed-by=/etc/apt/keyrings/kopia-keyring.gpg] http://packages.kopia.io/apt/ stable main" | sudo tee /etc/apt/sources.list.d/kopia.list
+     sudo apt update && sudo apt install kopia
+
+  2. Manual download:
+     https://github.com/kopia/kopia/releases
+
+After installation, verify with: kopia --version
+"""
+
+
+def get_rclone_install_instructions() -> str:
+    """Get installation instructions for rclone."""
+    if sys.platform == "win32":
+        return """
+rclone is not installed or not in PATH.
+
+Installation options:
+  1. Winget (recommended):
+     winget install Rclone.Rclone
+
+  2. Scoop:
+     scoop install rclone
+
+  3. Manual download:
+     https://rclone.org/downloads/
+     Download rclone-vX.X.X-windows-amd64.zip, extract, add to PATH
+
+After installation:
+  1. Verify with: rclone --version
+  2. Configure remotes with: rclone config
+"""
+    elif sys.platform == "darwin":
+        return """
+rclone is not installed or not in PATH.
+
+Installation options:
+  1. Homebrew (recommended):
+     brew install rclone
+
+  2. Manual download:
+     https://rclone.org/downloads/
+
+After installation:
+  1. Verify with: rclone --version
+  2. Configure remotes with: rclone config
+"""
+    else:
+        return """
+rclone is not installed or not in PATH.
+
+Installation options:
+  1. Package manager:
+     sudo apt install rclone  # Debian/Ubuntu
+     sudo dnf install rclone  # Fedora
+
+  2. Official installer (recommended for latest version):
+     curl https://rclone.org/install.sh | sudo bash
+
+  3. Manual download:
+     https://rclone.org/downloads/
+
+After installation:
+  1. Verify with: rclone --version
+  2. Configure remotes with: rclone config
+"""
+
+
+def validate_required_tools(require_rclone: bool = False) -> Tuple[bool, List[str]]:
+    """Validate that required external tools are available.
+
+    Args:
+        require_rclone: If True, also check for rclone availability
+
+    Returns:
+        Tuple of (all_tools_available, list_of_error_messages)
+    """
+    errors = []
+
+    # Check kopia
+    kopia_ok, kopia_result = check_tool_available(KOPIA_EXE)
+    if not kopia_ok:
+        errors.append(f"ERROR: {kopia_result}")
+        errors.append(get_kopia_install_instructions())
+    else:
+        logging.debug(f"Found kopia: {kopia_result}")
+
+    # Check rclone if required
+    if require_rclone:
+        rclone_ok, rclone_result = check_tool_available(RCLONE_EXE)
+        if not rclone_ok:
+            errors.append(f"ERROR: {rclone_result}")
+            errors.append(get_rclone_install_instructions())
+        else:
+            logging.debug(f"Found rclone: {rclone_result}")
+
+    return len(errors) == 0, errors
+
+
 def is_cloud_path(path: str) -> bool:
     """Check if path is a cloud destination (e.g., onedrive:, gdrive:).
 
@@ -114,7 +300,24 @@ VALID_REPO_FIELDS = {
 REQUIRED_REPO_FIELDS = {'name', 'local_destination_repo', 'local_config_file_path', 'sources'}
 
 
-def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
+def validate_source_paths(sources: List[str], repo_name: str) -> Tuple[bool, List[str]]:
+    """Validate that source paths exist.
+
+    Args:
+        sources: List of source paths to validate
+        repo_name: Name of the repository (for error messages)
+
+    Returns:
+        Tuple of (all_valid, list_of_warning_messages)
+    """
+    warnings = []
+    for source in sources:
+        if not os.path.exists(source):
+            warnings.append(f"  Warning: Source path does not exist for '{repo_name}': {source}")
+    return len(warnings) == 0, warnings
+
+
+def load_config(config_path: Optional[str] = None, validate_sources: bool = True) -> Dict[str, Any]:
     """Load and parse the YAML config file.
 
     Normalizes all paths for the current OS (Windows/Linux).
@@ -184,6 +387,12 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         # remote_destination_repo is a cloud path (rclone), don't normalize
         if 'sources' in repo:
             repo['sources'] = [os.path.normpath(s) for s in repo['sources']]
+
+        # Validate source paths exist (optional, but warn if not)
+        if validate_sources and 'sources' in repo:
+            _, source_warnings = validate_source_paths(repo['sources'], repo_name)
+            for warning in source_warnings:
+                print(warning, file=sys.stderr)
 
     return config
 

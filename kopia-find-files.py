@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 """
 kopia-find-files.py - Search for files across Kopia backup snapshots.
 
@@ -49,6 +50,12 @@ import kopia_utils as utils
 from typing import List, Dict, Any, Optional, Tuple
 
 # Logging configured in main() after argument parsing
+
+# Exit codes
+EXIT_SUCCESS = 0
+EXIT_TOOL_ERROR = 1
+EXIT_CONFIG_ERROR = 2
+EXIT_NO_RESULTS = 3
 
 
 def parse_ls_line(line: str) -> Optional[Tuple[int, str, str]]:
@@ -186,7 +193,7 @@ def find_in_repo(runner: utils.KopiaRunner, repo_config: Dict[str, Any], filenam
 
 def mount_repository(runner: utils.KopiaRunner, repo_config: Dict[str, Any], drive_letter: str, verbose: bool = False):
     name = repo_config['name']
-    config_file = repo_config['config_file_path']
+    config_file = repo_config['local_config_file_path']
 
     print(f"\nPreparing to mount '{name}' to {drive_letter}...")
 
@@ -300,9 +307,20 @@ def main():
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 
+    # Pre-flight check: ensure kopia is available
+    kopia_ok, kopia_result = utils.check_tool_available(utils.KOPIA_EXE)
+    if not kopia_ok:
+        print(f"ERROR: {kopia_result}", file=sys.stderr)
+        print(utils.get_kopia_install_instructions(), file=sys.stderr)
+        sys.exit(EXIT_TOOL_ERROR)
+
     # Initialize KopiaRunner
-    runner = utils.KopiaRunner()
-    config = runner.config
+    try:
+        runner = utils.KopiaRunner()
+        config = runner.config
+    except SystemExit:
+        sys.exit(EXIT_CONFIG_ERROR)
+
     repos = config['repositories']
 
     # Determine snapshot limit

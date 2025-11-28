@@ -45,6 +45,12 @@ from datetime import datetime, timedelta, timezone
 import kopia_utils as utils
 from typing import List, Dict, Any, Optional, Tuple
 
+# Exit codes
+EXIT_SUCCESS = 0
+EXIT_TOOL_ERROR = 1       # Missing tools (kopia not installed)
+EXIT_HEALTH_WARNING = 2   # Health check found issues (stale backups, failures)
+EXIT_CONFIG_ERROR = 3     # Configuration errors
+
 # Defaults (can be overridden in kopia-configs.yaml)
 DEFAULT_STALE_MINUTES = 10080  # 7 days
 DEFAULT_INTERVAL_MINUTES = 180  # 3 hours
@@ -330,7 +336,7 @@ def show_detailed_status(runner: utils.KopiaRunner, repo_config: Dict[str, Any],
 
         if repo_cloud:
             if not repo_cloud.get('success', True):
-                print(f"Cloud Sync: ❌ FAILED → {remote_dest}")
+                print(f"Cloud Sync: [FAIL] FAILED -> {remote_dest}")
                 print(f"            Error: {repo_cloud.get('error', 'Unknown')}")
             else:
                 last_sync_str = repo_cloud.get('last_sync')
@@ -338,13 +344,13 @@ def show_detailed_status(runner: utils.KopiaRunner, repo_config: Dict[str, Any],
                     try:
                         last_sync = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
                         sync_time = last_sync.astimezone().strftime("%Y-%m-%d %H:%M")
-                        print(f"Cloud Sync: ✓ OK [{sync_time}] → {remote_dest}")
+                        print(f"Cloud Sync: [OK] [{sync_time}] -> {remote_dest}")
                     except (ValueError, TypeError):
-                        print(f"Cloud Sync: ✓ OK → {remote_dest}")
+                        print(f"Cloud Sync: [OK] -> {remote_dest}")
                 else:
-                    print(f"Cloud Sync: ✓ OK → {remote_dest}")
+                    print(f"Cloud Sync: [OK] -> {remote_dest}")
         else:
-            print(f"Cloud Sync: (no sync recorded) → {remote_dest}")
+            print(f"Cloud Sync: (no sync recorded) -> {remote_dest}")
 
     # Get and display repository disk size
     repo_size = get_repository_size(runner, repo_config)
@@ -677,9 +683,20 @@ Examples:
         stream=sys.stdout
     )
 
+    # Pre-flight check: ensure kopia is available
+    kopia_ok, kopia_result = utils.check_tool_available(utils.KOPIA_EXE)
+    if not kopia_ok:
+        print(f"ERROR: {kopia_result}", file=sys.stderr)
+        print(utils.get_kopia_install_instructions(), file=sys.stderr)
+        sys.exit(EXIT_TOOL_ERROR)
+
     # Initialize KopiaRunner
-    runner = utils.KopiaRunner()
-    config = runner.config
+    try:
+        runner = utils.KopiaRunner()
+        config = runner.config
+    except SystemExit:
+        # Config loading failed (already printed error)
+        sys.exit(EXIT_CONFIG_ERROR)
 
     # Get settings
     settings = config.get('settings') or {}
@@ -755,7 +772,7 @@ Examples:
             print("Kopia Backup Failed (TEST)")
             print(message)
         else:
-            show_toast_notification("❌ Kopia Backup Failed (TEST)", message)
+            show_toast_notification("[FAIL] Kopia Backup Failed (TEST)", message)
         return
 
     # 4. Health Check (Default)
@@ -782,7 +799,7 @@ Examples:
             print("Kopia Backup Warning")
             print(message)
         else:
-            show_toast_notification("⚠️ Kopia Backup Warning", message)
+            show_toast_notification("[WARN] Kopia Backup Warning", message)
 
     # Handle recent failures warning
     if recent_failures:
@@ -813,7 +830,7 @@ Examples:
                 local_time = f['time'].astimezone().strftime("%H:%M")
                 print(f"  - [{local_time}] {f['repo']}: {f['reason']} ({f['source']})")
         else:
-            show_toast_notification(f"❌ Kopia Backup Failed ({len(recent_failures)})", failure_msg)
+            show_toast_notification(f"[FAIL] Kopia Backup Failed ({len(recent_failures)})", failure_msg)
 
     # Check cloud sync status
     stale_threshold = settings.get('health_check_stale_minutes', DEFAULT_STALE_MINUTES)
@@ -832,7 +849,7 @@ Examples:
             for f in cloud_failures:
                 print(f"  - {f['repo']}: {f['error']} ({f['remote']})")
         else:
-            show_toast_notification(f"❌ Cloud Sync Failed ({len(cloud_failures)})", sync_msg)
+            show_toast_notification(f"[FAIL] Cloud Sync Failed ({len(cloud_failures)})", sync_msg)
 
     if stale_syncs and not cloud_failures:
         # Only warn about stale syncs if there are no outright failures
@@ -848,7 +865,7 @@ Examples:
             print("Cloud Sync Warning")
             print(sync_msg)
         else:
-            show_toast_notification("⚠️ Cloud Sync Warning", sync_msg)
+            show_toast_notification("[WARN] Cloud Sync Warning", sync_msg)
 
     # Verbose mode
     if args.verbose:
@@ -906,7 +923,7 @@ Examples:
 
                 if repo_cloud:
                     if not repo_cloud.get('success', True):
-                        print(f"    [cloud] ❌ FAILED → {remote_dest}")
+                        print(f"    [cloud] [FAIL] FAILED -> {remote_dest}")
                         print(f"            Error: {repo_cloud.get('error', 'Unknown')}")
                     else:
                         last_sync_str = repo_cloud.get('last_sync')
@@ -914,18 +931,22 @@ Examples:
                             try:
                                 last_sync = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
                                 sync_time = last_sync.astimezone().strftime("%H:%M")
-                                print(f"    [cloud] ✓ OK [{sync_time}] → {remote_dest}")
+                                print(f"    [cloud] [OK] [{sync_time}] -> {remote_dest}")
                             except (ValueError, TypeError):
-                                print(f"    [cloud] ✓ OK → {remote_dest}")
+                                print(f"    [cloud] [OK] -> {remote_dest}")
                         else:
-                            print(f"    [cloud] ✓ OK → {remote_dest}")
+                            print(f"    [cloud] [OK] -> {remote_dest}")
                 else:
-                    print(f"    [cloud] (no sync recorded) → {remote_dest}")
+                    print(f"    [cloud] (no sync recorded) -> {remote_dest}")
 
     elif is_healthy and not recent_failures and not cloud_failures:
         if not args.scheduled and last_backup:
             local_time = last_backup.astimezone().strftime("%Y-%m-%d %H:%M")
             print(f"OK: Last backup at {local_time}")
+
+    # Determine exit code based on health status
+    has_issues = not is_healthy or recent_failures or cloud_failures or stale_syncs
+    sys.exit(EXIT_HEALTH_WARNING if has_issues else EXIT_SUCCESS)
 
 
 if __name__ == "__main__":

@@ -30,13 +30,76 @@ import sys
 import logging
 import argparse
 import kopia_utils as utils
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 
 # Logging configured in main() after argument parsing
 
 # Default (can be overridden in kopia-configs.yaml under 'settings')
 DEFAULT_BACKUP_INTERVAL_MINUTES = 15
 TASK_NAME = "KopiaHelperBackup"
+
+
+def preflight_checks(config: Dict[str, Any], runner: utils.KopiaRunner) -> Tuple[bool, List[str]]:
+    """Perform pre-flight validation before starting backups.
+
+    Checks:
+    1. Kopia is installed and available
+    2. Rclone is installed if any repo needs cloud sync
+    3. All repository passwords are available
+    4. Source paths exist (warnings only)
+
+    Args:
+        config: Loaded configuration dict
+        runner: KopiaRunner instance (for password lookup)
+
+    Returns:
+        Tuple of (all_checks_passed, list_of_error_messages)
+    """
+    errors = []
+    warnings = []
+
+    # Check if any repo needs rclone
+    needs_rclone = any(
+        utils.has_remote_destination(repo)
+        for repo in config.get('repositories', [])
+    )
+
+    # 1. Validate required tools
+    tools_ok, tool_errors = utils.validate_required_tools(require_rclone=needs_rclone)
+    if not tools_ok:
+        errors.extend(tool_errors)
+
+    # 2. Validate passwords for all repositories
+    for repo in config.get('repositories', []):
+        repo_name = repo.get('name', 'unknown')
+        password = runner.get_password(repo)
+        if not password:
+            errors.append(f"ERROR: No password configured for repository '{repo_name}'")
+
+    # 3. Check source paths exist (warnings, not errors)
+    for repo in config.get('repositories', []):
+        repo_name = repo.get('name', 'unknown')
+        for source in repo.get('sources', []):
+            if not os.path.exists(source):
+                warnings.append(f"Warning: Source path does not exist for '{repo_name}': {source}")
+
+    # 4. If rclone is needed, validate remotes are configured
+    if needs_rclone and tools_ok:
+        rclone = utils.RcloneRunner()
+        for repo in config.get('repositories', []):
+            if utils.has_remote_destination(repo):
+                remote_dest = repo.get('remote_destination_repo', '')
+                if ':' in remote_dest:
+                    remote_name = remote_dest.split(':')[0]
+                    if not rclone.check_remote_configured(remote_name):
+                        errors.append(f"ERROR: rclone remote '{remote_name}' is not configured for '{repo.get('name')}'")
+                        errors.append(f"  Run 'rclone config' to set up the '{remote_name}' remote.")
+
+    # Print warnings (but don't fail)
+    for warning in warnings:
+        print(warning, file=sys.stderr)
+
+    return len(errors) == 0, errors
 
 
 def ensure_repository_connected(runner: utils.KopiaRunner, repo_config: Dict[str, Any], dry_run: bool = False) -> bool:
@@ -123,16 +186,26 @@ def run_backup_job(
     print()
 
     if not ensure_repository_connected(runner, repo_config, dry_run):
-        print(f"Skipping {repo_name} due to connection failure.")
+        print(f"[ERROR] Skipping {repo_name} due to connection failure.")
         return False
 
     config_file = repo_config['local_config_file_path']
     policies = repo_config.get('policies', {})
-    backup_success = True
+
+    # Track errors per source
+    snapshot_errors: List[str] = []
+    policy_warnings: List[str] = []
 
     for source in repo_config['sources']:
+        # Check if source path exists before trying to back it up
+        if not os.path.exists(source):
+            error_msg = f"Source path does not exist: {source}"
+            logging.error(f"[kopia] {error_msg}")
+            snapshot_errors.append(error_msg)
+            continue
+
         # 1. Set Policy (Idempotent-ish, but good to ensure)
-        print(f"[kopia] Setting policies...")
+        print(f"[kopia] Setting policies for {source}...")
         policy_cmd = ["policy", "set", source, "--config-file", config_file]
 
         # Add retention flags
@@ -146,14 +219,18 @@ def run_backup_job(
         # Run main policy command (retention, etc.)
         success, _, stderr, _ = runner.run(policy_cmd, repo_config=repo_config, dry_run=dry_run)
         if not success:
-            print(f"[kopia] Warning: Policy set failed: {stderr}")
+            warning = f"Policy set failed for {source}: {stderr}"
+            print(f"[kopia] Warning: {warning}")
+            policy_warnings.append(warning)
 
         # Handle ignore patterns - must be separate commands because Kopia
         # processes --clear-ignore AFTER --add-ignore when on same command line
         clear_ignore_cmd = ["policy", "set", source, "--config-file", config_file, "--clear-ignore"]
         success, _, stderr, _ = runner.run(clear_ignore_cmd, repo_config=repo_config, dry_run=dry_run)
         if not success:
-            print(f"[kopia] Warning: Clear ignore failed: {stderr}")
+            warning = f"Clear ignore failed for {source}: {stderr}"
+            print(f"[kopia] Warning: {warning}")
+            policy_warnings.append(warning)
 
         if 'ignore' in policies and policies['ignore']:
             add_ignore_cmd = ["policy", "set", source, "--config-file", config_file]
@@ -161,25 +238,44 @@ def run_backup_job(
                 add_ignore_cmd.extend(["--add-ignore", pattern])
             success, _, stderr, _ = runner.run(add_ignore_cmd, repo_config=repo_config, dry_run=dry_run)
             if not success:
-                print(f"[kopia] Warning: Add ignore patterns failed: {stderr}")
+                warning = f"Add ignore patterns failed for {source}: {stderr}"
+                print(f"[kopia] Warning: {warning}")
+                policy_warnings.append(warning)
 
         # 2. Create Snapshot
-        print(f"[kopia] Creating snapshot...")
+        print(f"[kopia] Creating snapshot for {source}...")
         snapshot_cmd = ["snapshot", "create", source, "--config-file", config_file]
 
         success, _, stderr, _ = runner.run(snapshot_cmd, repo_config=repo_config, dry_run=dry_run)
         if not success:
-            logging.error(f"[kopia] Snapshot failed: {stderr}")
-            backup_success = False
+            error_msg = f"Snapshot failed for {source}: {stderr}"
+            logging.error(f"[kopia] {error_msg}")
+            snapshot_errors.append(error_msg)
         else:
-            print(f"[kopia] Snapshot complete.")
+            print(f"[kopia] Snapshot complete for {source}")
 
     # 3. Sync to cloud if configured (remote_destination_repo is set)
+    cloud_success = True
     if has_cloud:
-        if not sync_to_cloud(repo_config, scheduled=scheduled, dry_run=dry_run):
-            return False
+        cloud_success = sync_to_cloud(repo_config, scheduled=scheduled, dry_run=dry_run)
 
-    print(f"\n✓ {repo_name} complete")
+    # Summarize results for this repo
+    backup_success = len(snapshot_errors) == 0 and cloud_success
+
+    if backup_success:
+        if policy_warnings:
+            print(f"\n[WARN] {repo_name} complete with {len(policy_warnings)} policy warning(s)")
+        else:
+            print(f"\n[OK] {repo_name} complete")
+    else:
+        print(f"\n[FAIL] {repo_name} FAILED")
+        if snapshot_errors:
+            print(f"  Snapshot errors:")
+            for err in snapshot_errors:
+                print(f"    - {err}")
+        if not cloud_success:
+            print(f"  Cloud sync failed")
+
     return backup_success
 
 
@@ -291,6 +387,8 @@ def main():
     parser.add_argument("--maintenance", action="store_true", help="Run full maintenance")
     parser.add_argument("--repo", type=str, default=None,
                         help="Comma-separated list of repo names to backup now (default: all repos)")
+    parser.add_argument("--skip-preflight", action="store_true",
+                        help="Skip pre-flight validation checks (not recommended)")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Set logging level (default: INFO)")
@@ -329,7 +427,19 @@ def main():
         config['repositories'] = [r for r in config['repositories'] if r['name'] in repo_filter]
         if not config['repositories']:
             logging.error(f"No matching repositories found for: {args.repo}")
-            return
+            sys.exit(1)
+
+    # Perform pre-flight checks (unless skipped or just registering)
+    if not args.skip_preflight and not args.register:
+        preflight_ok, preflight_errors = preflight_checks(config, runner)
+        if not preflight_ok:
+            print("\n" + "="*60, file=sys.stderr)
+            print("PRE-FLIGHT CHECKS FAILED", file=sys.stderr)
+            print("="*60, file=sys.stderr)
+            for error in preflight_errors:
+                print(error, file=sys.stderr)
+            print("\nUse --skip-preflight to bypass these checks (not recommended).", file=sys.stderr)
+            sys.exit(1)
 
     if args.register:
         success = register_backup_task(config)
@@ -340,7 +450,7 @@ def main():
             for src in repo.get('sources', []):
                 logging.info(f"    - {src}")
         if not args.maintenance:
-            return  # Exit after registration (unless maintenance also requested)
+            sys.exit(0 if success else 1)
 
     # Auto-register if not already registered (only when running as admin and not launched by scheduler)
     if utils.is_admin() and not args.scheduled and not utils.is_task_registered(TASK_NAME):
@@ -349,18 +459,50 @@ def main():
             logging.info("Auto-registration complete. Continuing with backup...")
         else:
             logging.error("Auto-registration failed. Continuing with backup anyway...")
-    
+
+    # Track overall success across all repos
+    overall_success = True
+    failed_repos: List[str] = []
+    successful_repos: List[str] = []
+
     for repo in config['repositories']:
+        repo_name = repo.get('name', 'unknown')
+
         # Skip backups if only --register --maintenance was requested
         if not args.register:
-            run_backup_job(runner, repo, scheduled=args.scheduled, dry_run=args.dry_run)
+            backup_success = run_backup_job(runner, repo, scheduled=args.scheduled, dry_run=args.dry_run)
+            if backup_success:
+                successful_repos.append(repo_name)
+            else:
+                failed_repos.append(repo_name)
+                overall_success = False
 
         if args.maintenance:
-            logging.info(f"Running maintenance for {repo['name']}...")
-            runner.run(
+            logging.info(f"Running maintenance for {repo_name}...")
+            maint_success, _, maint_stderr, _ = runner.run(
                 ["maintenance", "run", "--full", "--config-file", repo['local_config_file_path']],
                 repo_config=repo, dry_run=args.dry_run
             )
+            if not maint_success:
+                logging.error(f"Maintenance failed for {repo_name}: {maint_stderr}")
+                if repo_name not in failed_repos:
+                    failed_repos.append(repo_name)
+                overall_success = False
+
+    # Print summary
+    if not args.register:
+        print(f"\n{'='*60}")
+        print("BACKUP SUMMARY")
+        print(f"{'='*60}")
+        if successful_repos:
+            print(f"Successful: {', '.join(successful_repos)}")
+        if failed_repos:
+            print(f"Failed: {', '.join(failed_repos)}")
+        print(f"{'='*60}")
+
+    # Exit with proper code
+    sys.exit(0 if overall_success else 1)
+
 
 if __name__ == "__main__":
     main()

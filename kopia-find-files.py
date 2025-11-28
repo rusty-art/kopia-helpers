@@ -93,7 +93,7 @@ def parse_ls_line(line: str) -> Optional[Tuple[int, str, str]]:
 def find_in_repo(runner: utils.KopiaRunner, repo_config: Dict[str, Any], filename_pattern: str, max_snapshots: Optional[int] = None, match_path: bool = False, verbose: bool = False) -> List[Dict[str, Any]]:
     """Search for files using kopia ls -l -r (gets file details directly, no mounting)."""
     name = repo_config['name']
-    config_file = repo_config['config_file_path']
+    config_file = repo_config['local_config_file_path']
 
     print(f"  Searching in {name}...")
 
@@ -271,7 +271,7 @@ def find_free_drive_letter() -> Optional[str]:
 def list_repositories(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     print("\nAvailable Repositories:")
     for i, repo in enumerate(config['repositories']):
-        print(f"[{i}] {repo['name']} ({repo['repository_path']})")
+        print(f"[{i}] {repo['name']} ({repo['local_destination_repo']})")
     return config['repositories']
 
 

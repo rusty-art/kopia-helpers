@@ -22,9 +22,9 @@ If you only have one backup destination, just use Kopia directly. If you follow 
 
 | Script | Description |
 |--------|-------------|
-| `kopia-start-backups.py` | Main backup script - creates snapshots, sets policies, also schedules in task-scheduler |
-| `kopia-health-check.py` | Alert if no backups in 7 days (toast notification), also schedules in task-scheduler |
-| `kopia-check-backups.py` | Shows backup status and recent snapshots |
+| `kopia-start-backups.py` | Main backup script - creates snapshots, sets policies, schedules in task-scheduler |
+| `kopia-stop-backups.py` | Unregister scheduled tasks (backups and/or health checks) |
+| `kopia-health-check.py` | Alert if no backups in 7 days (toast notification), schedules in task-scheduler |
 | `kopia-find-files.py` | Search for files across all snapshots |
 
 ## Setup
@@ -86,6 +86,57 @@ python kopia-health-check.py --register
 
 This checks every 3 hours and shows a toast notification if no backups for 7 days (configurable in kopia-configs.yaml).
 
+## Cloud Backup (OneDrive, Google Drive, etc.)
+
+For cloud destinations, these scripts use [rclone](https://rclone.org/) to sync your local Kopia repository to the cloud. This is more reliable than the OneDrive desktop client for automated backups (which warns about bulk deletes, has character encoding issues, etc.).
+
+### How it works
+
+1. Kopia writes snapshots to a local directory repo as per normal
+2. After backup completes, rclone syncs the kopia repo to your cloud destination
+3. The cloud provider's desktop client can sync back for fast local restores
+
+### Setup
+
+1. Install rclone: https://rclone.org/downloads/
+2. Configure your cloud remote:
+   ```bash
+   rclone config
+   # Choose 'n' for new remote
+   # Name it: onedrive (or gdrive, dropbox, etc.)
+   # Follow the browser auth flow
+   ```
+3. Test connectivity:
+   ```bash
+   rclone lsd onedrive:
+   ```
+4. Add a cloud repository to `kopia-configs.yaml`:
+   ```yaml
+   repositories:
+     - name: cloud-backup
+       local_destination_repo: C:/kopia-cache/mysrc               # Where Kopia writes locally
+       remote_destination_repo: onedrive:mybackups/kopia          # rclone sync destination
+       local_config_file_path: C:/kopia-cache/mysrc/repository.config
+       password: your-password
+       sources:
+         - C:/Users/username/Documents
+         - ...
+       policies:
+         # ... same as local repos
+   ```
+
+Kopia writes to `local_destination_repo`, then rclone syncs to `remote_destination_repo` (e.g., `onedrive:`, `gdrive:`, `dropbox:`).
+
+### Supported cloud providers
+
+Any [rclone-supported backend](https://rclone.org/overview/) works:
+- OneDrive / OneDrive for Business
+- Google Drive
+- Dropbox
+- Amazon S3
+- Backblaze B2
+- And many more...
+
 ## Finding Files
 
 Search for files across all snapshots using `find -name` style patterns:
@@ -123,6 +174,7 @@ All scripts support:
 - Python 3.8+
 - PyYAML: `pip install pyyaml`
 - python-dotenv (optional): `pip install python-dotenv`
+- rclone (optional, for cloud backup): https://rclone.org/downloads/
 
 ## License
 

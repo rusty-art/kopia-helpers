@@ -2,11 +2,18 @@
 kopia_utils.py - Shared utilities for Kopia backup scripts.
 
 Provides common functionality used across all Kopia scripts:
-- Configuration loading from YAML (with path normalization)
+- Configuration loading from YAML (with path normalization and field name migration)
 - KopiaRunner class for command execution and password management
+- RcloneRunner class for cloud sync operations
+- Cloud path detection (is_cloud_path) and remote destination checking
 - Timestamp formatting (local or UTC)
 - pythonw.exe detection for background task scheduling
 - Windows Task Scheduler registration
+
+Config field names (backwards compatible):
+    - local_destination_repo (or repository_path, destination_repo) - where Kopia writes locally
+    - local_config_file_path (or config_file_path) - Kopia config file
+    - remote_destination_repo - rclone destination for cloud sync (optional)
 
 Password lookup order:
     1. yaml config: password field
@@ -23,7 +30,8 @@ import subprocess
 import logging
 import yaml
 import re
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Tuple, Optional, List, Dict, Any, Union
 
@@ -31,13 +39,90 @@ from typing import Tuple, Optional, List, Dict, Any, Union
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 KOPIA_EXE = "kopia"
+RCLONE_EXE = "rclone"
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "kopia-configs.yaml")
+STATUS_FILE = os.path.join(Path.home(), ".kopia-status.json")
+
+
+def is_cloud_path(path: str) -> bool:
+    """Check if path is a cloud destination (e.g., onedrive:, gdrive:).
+
+    Cloud paths have the format 'remote:path' where remote doesn't look like
+    a Windows drive letter (e.g., 'C:').
+
+    Args:
+        path: Path string to check
+
+    Returns:
+        True if path appears to be a cloud/rclone remote path.
+    """
+    if not path or ':' not in path:
+        return False
+    # Windows paths like C:\foo have colon at position 1
+    # Cloud paths like onedrive:foo have colon after the remote name
+    colon_pos = path.index(':')
+    # Windows drive letters are single characters (C:, D:, etc.)
+    # Cloud remotes are typically longer (onedrive:, gdrive:, s3:, etc.)
+    return colon_pos > 1
+
+
+def has_remote_destination(repo_config: Dict[str, Any]) -> bool:
+    """Check if repository has a remote destination for cloud sync.
+
+    Args:
+        repo_config: Repository configuration dict
+
+    Returns:
+        True if remote_destination_repo is configured.
+    """
+    return bool(repo_config.get('remote_destination_repo'))
+
+
+def get_local_repo_path(repo_config: Dict[str, Any]) -> str:
+    """Get the local filesystem path where Kopia writes.
+
+    Args:
+        repo_config: Repository configuration dict (uses local_destination_repo)
+
+    Returns:
+        Filesystem path for Kopia repository.
+    """
+    return repo_config.get('local_destination_repo', '')
+
+
+def get_config_file_path(repo_config: Dict[str, Any]) -> str:
+    """Get the config file path for a repository.
+
+    Args:
+        repo_config: Repository configuration dict (uses local_config_file_path)
+
+    Returns:
+        Path to repository config file.
+    """
+    return repo_config.get('local_config_file_path', '')
+
+
+# Valid field names for repository config (for validation)
+VALID_REPO_FIELDS = {
+    # Current field names
+    'name', 'local_destination_repo', 'local_config_file_path', 'remote_destination_repo',
+    'password', 'sources', 'policies',
+    # Backwards-compatible aliases
+    'repository_path', 'config_file_path', 'destination_repo',
+}
+
+REQUIRED_REPO_FIELDS = {'name', 'local_destination_repo', 'local_config_file_path', 'sources'}
 
 
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     """Load and parse the YAML config file.
 
     Normalizes all paths for the current OS (Windows/Linux).
+    Also normalizes field names for backwards compatibility:
+      - repository_path -> local_destination_repo
+      - config_file_path -> local_config_file_path
+
+    Validates field names and required fields, exits with error on unknown fields.
     """
     if config_path is None:
         config_path = CONFIG_FILE
@@ -53,12 +138,50 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
         print(f"  {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Normalize all paths for current OS
+    # Validate and normalize each repository
     for repo in config.get('repositories', []):
-        if 'repository_path' in repo:
-            repo['repository_path'] = os.path.normpath(repo['repository_path'])
-        if 'config_file_path' in repo:
-            repo['config_file_path'] = os.path.normpath(repo['config_file_path'])
+        repo_name = repo.get('name', '<unnamed>')
+
+        # Check for unknown fields (typos)
+        unknown_fields = set(repo.keys()) - VALID_REPO_FIELDS
+        if unknown_fields:
+            print(f"Error: Unknown field(s) in repository '{repo_name}': {', '.join(sorted(unknown_fields))}", file=sys.stderr)
+            print(f"  Valid fields: {', '.join(sorted(VALID_REPO_FIELDS))}", file=sys.stderr)
+            sys.exit(1)
+
+        # Backwards compatibility: accept both old and new field names
+        # Prefer new names if both are present
+
+        # repository_path -> local_destination_repo
+        if 'local_destination_repo' not in repo and 'repository_path' in repo:
+            repo['local_destination_repo'] = repo.pop('repository_path')
+        elif 'repository_path' in repo:
+            repo.pop('repository_path')  # Remove old name if new name exists
+
+        # destination_repo -> local_destination_repo
+        if 'local_destination_repo' not in repo and 'destination_repo' in repo:
+            repo['local_destination_repo'] = repo.pop('destination_repo')
+        elif 'destination_repo' in repo:
+            repo.pop('destination_repo')  # Remove old name if new name exists
+
+        # config_file_path -> local_config_file_path
+        if 'local_config_file_path' not in repo and 'config_file_path' in repo:
+            repo['local_config_file_path'] = repo.pop('config_file_path')
+        elif 'config_file_path' in repo:
+            repo.pop('config_file_path')  # Remove old name if new name exists
+
+        # Check required fields (after normalization)
+        missing_fields = REQUIRED_REPO_FIELDS - set(repo.keys())
+        if missing_fields:
+            print(f"Error: Missing required field(s) in repository '{repo_name}': {', '.join(sorted(missing_fields))}", file=sys.stderr)
+            sys.exit(1)
+
+        # Normalize paths for current OS
+        if 'local_destination_repo' in repo:
+            repo['local_destination_repo'] = os.path.normpath(repo['local_destination_repo'])
+        if 'local_config_file_path' in repo:
+            repo['local_config_file_path'] = os.path.normpath(repo['local_config_file_path'])
+        # remote_destination_repo is a cloud path (rclone), don't normalize
         if 'sources' in repo:
             repo['sources'] = [os.path.normpath(s) for s in repo['sources']]
 
@@ -347,6 +470,23 @@ def get_pythonw_exe() -> str:
         return sys.executable
 
 
+def is_admin() -> bool:
+    """Check if the current process is running with Administrator privileges.
+
+    Returns:
+        True if running as Administrator, False otherwise.
+    """
+    if sys.platform != "win32":
+        # On non-Windows, check if running as root
+        return os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        return False
+
+
 def is_task_registered(task_name: str) -> bool:
     """Check if a Windows Task Scheduler task is registered.
 
@@ -417,3 +557,231 @@ def register_scheduled_task(
     except Exception as e:
         print(f"Error registering task: {e}")
         return False
+
+
+class RcloneRunner:
+    """Handles rclone command execution for cloud sync operations."""
+
+    def __init__(self):
+        self._rclone_not_found_warned = False
+
+    def check_remote_configured(self, remote_name: str) -> bool:
+        """Check if an rclone remote is configured.
+
+        Args:
+            remote_name: Name of the remote (e.g., 'onedrive')
+
+        Returns:
+            True if remote is configured, False otherwise.
+        """
+        try:
+            result = subprocess.run(
+                [RCLONE_EXE, "listremotes"],
+                capture_output=True,
+                text=True,
+                encoding='utf-8'
+            )
+            if result.returncode != 0:
+                return False
+            # listremotes outputs "remotename:" on each line
+            configured_remotes = [line.rstrip(':') for line in result.stdout.strip().split('\n') if line]
+            return remote_name in configured_remotes
+        except FileNotFoundError:
+            if not self._rclone_not_found_warned:
+                logging.error("rclone not found. Install from https://rclone.org/downloads/")
+                self._rclone_not_found_warned = True
+            return False
+        except Exception as e:
+            logging.error(f"Error checking rclone remotes: {e}")
+            return False
+
+    def sync(
+        self,
+        local_path: str,
+        remote: str,
+        quiet: bool = False,
+        dry_run: bool = False
+    ) -> Tuple[bool, str]:
+        """Sync local path to remote using rclone sync.
+
+        Args:
+            local_path: Local filesystem path to sync from
+            remote: Remote destination (e.g., 'onedrive:Backups/kopia')
+            quiet: If True, minimal output (for scheduled runs)
+            dry_run: If True, simulate without making changes
+
+        Returns:
+            (success, error_message) tuple
+        """
+        cmd = [
+            RCLONE_EXE, "sync",
+            local_path, remote,
+            "--transfers=4",
+            "--checkers=8",
+            "--retries=3",
+            "--low-level-retries=10",
+        ]
+
+        if quiet:
+            cmd.append("--quiet")
+        else:
+            cmd.extend(["--stats=30s", "--progress"])
+
+        if dry_run:
+            cmd.append("--dry-run")
+            logging.info(f"[DRY-RUN] Would execute: {subprocess.list2cmdline(cmd)}")
+            return True, ""
+
+        logging.debug(f"Executing: {subprocess.list2cmdline(cmd)}")
+
+        try:
+            if quiet:
+                # Scheduled mode: capture output, hide window
+                creation_flags = 0x08000000 if sys.platform == "win32" else 0
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    creationflags=creation_flags
+                )
+                if result.returncode == 0:
+                    return True, ""
+                else:
+                    error_msg = result.stderr.strip() or f"rclone exited with code {result.returncode}"
+                    return False, error_msg
+            else:
+                # Interactive mode: let output flow to terminal for progress display
+                result = subprocess.run(cmd)
+                if result.returncode == 0:
+                    return True, ""
+                else:
+                    return False, f"rclone exited with code {result.returncode}"
+
+        except KeyboardInterrupt:
+            logging.warning("Sync interrupted")
+            return False, "Sync interrupted by user"
+        except FileNotFoundError:
+            if not self._rclone_not_found_warned:
+                logging.error("rclone not found. Install from https://rclone.org/downloads/")
+                self._rclone_not_found_warned = True
+            return False, "rclone_not_found"
+        except Exception as e:
+            return False, str(e)
+
+    @staticmethod
+    def get_setup_instructions(remote_type: str = "onedrive") -> str:
+        """Get setup instructions for configuring an rclone remote.
+
+        Args:
+            remote_type: Type of remote (default: 'onedrive')
+
+        Returns:
+            Multi-line instruction string.
+        """
+        if remote_type == "onedrive":
+            return """
+To set up OneDrive with rclone:
+  1. Run: rclone config
+  2. Choose 'n' for new remote
+  3. Name it: onedrive
+  4. Choose 'onedrive' as storage type
+  5. Follow the browser auth flow
+  6. Test with: rclone lsd onedrive:
+
+For detailed instructions: https://rclone.org/onedrive/
+"""
+        return f"Run 'rclone config' to set up a '{remote_type}' remote."
+
+
+def _load_status_file() -> Dict[str, Any]:
+    """Load the entire status file.
+
+    Returns:
+        Full status dict, or empty dict if file doesn't exist.
+    """
+    if not os.path.exists(STATUS_FILE):
+        return {}
+    try:
+        with open(STATUS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logging.warning(f"Could not load status file: {e}")
+        return {}
+
+
+def _save_status_file(status: Dict[str, Any]) -> None:
+    """Save status file atomically (write to temp, then rename).
+
+    Args:
+        status: Full status dict to save.
+    """
+    try:
+        # Write to temp file first
+        temp_file = STATUS_FILE + ".tmp"
+        with open(temp_file, 'w', encoding='utf-8') as f:
+            json.dump(status, f, indent=2)
+        # Atomic rename (on Windows, need to remove target first)
+        if sys.platform == "win32" and os.path.exists(STATUS_FILE):
+            os.replace(temp_file, STATUS_FILE)
+        else:
+            os.rename(temp_file, STATUS_FILE)
+    except IOError as e:
+        logging.error(f"Could not save status file: {e}")
+
+
+def load_cloud_sync_status() -> Dict[str, Any]:
+    """Load cloud sync status from the status file.
+
+    Returns:
+        Dict mapping repo names to their sync status, or empty dict if not found.
+    """
+    status = _load_status_file()
+    return status.get("cloud_sync", {})
+
+
+def update_cloud_sync_status(
+    repo_name: str,
+    remote: str,
+    success: bool,
+    error: Optional[str] = None
+) -> None:
+    """Update the cloud sync status for a repository.
+
+    Args:
+        repo_name: Name of the repository
+        remote: Remote destination (e.g., 'onedrive:Backups/kopia')
+        success: Whether the sync succeeded
+        error: Error message if sync failed
+    """
+    status = _load_status_file()
+    if "cloud_sync" not in status:
+        status["cloud_sync"] = {}
+
+    status["cloud_sync"][repo_name] = {
+        "last_sync": datetime.now(timezone.utc).isoformat(),
+        "success": success,
+        "remote": remote,
+        "error": error
+    }
+    _save_status_file(status)
+
+
+def cleanup_status_file(valid_repo_names: List[str]) -> None:
+    """Remove status entries for repos that no longer exist in config.
+
+    Args:
+        valid_repo_names: List of repo names currently in config.
+    """
+    status = _load_status_file()
+    changed = False
+
+    if "cloud_sync" in status:
+        stale_repos = [name for name in status["cloud_sync"] if name not in valid_repo_names]
+        for name in stale_repos:
+            del status["cloud_sync"][name]
+            logging.debug(f"Cleaned up stale status for '{name}'")
+            changed = True
+
+    if changed:
+        _save_status_file(status)

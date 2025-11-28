@@ -35,8 +35,8 @@ settings:
 
 repositories:
   - name: my-backup1
-    repository_path: /path/to/backup/destination1
-    config_file_path: /path/to/backup/destination1/repository.config
+    local_destination_repo: /path/to/backup/destination1
+    local_config_file_path: /path/to/backup/destination1/repository.config
     password: your_password1_here  # or set via env var (see README for details)
 
     sources:
@@ -57,7 +57,12 @@ repositories:
       # If Kopia is triggered before this interval, it will skip creating a snapshot
       # In reality we setup up Task Scheduler to run every 15 minutes, so this is just a safety-catch
       snapshot-interval: 10m
-      
+
+      # Remote copy interval - minimum time between rclone syncs to cloud
+      # Default: 60m (1 hour). Syncing every 15 minutes is usually overkill.
+      # Supports: 30s, 10m, 1h, etc.
+      # remote-copy-interval: 60m
+
       # Snapshot mode - VSS (Volume Shadow Copy) for Windows
       snapshot-mode: VSS
       
@@ -70,8 +75,9 @@ repositories:
 
   # Add more repositories as needed, e.g.:
   - name: backup2
-    repository_path: /path/to/backup/destination2
-    config_file_path: /path/to/backup/destination2/repository.config
+    local_destination_repo: /local-path/to/kopia-repo           # Where Kopia writes locally
+    remote_destination_repo: onedrive:path/to/cloud-backup-dir  # Optional: rclone sync destination
+    local_config_file_path: /local-path/to/kopia-repo/repository.config
     password: your_password2_here  # or set via env var (see README for details)
 
     sources:
@@ -86,3 +92,30 @@ repositories:
       keep-latest: 100
       snapshot-interval: 10m
       snapshot-mode: VSS  # Windows only
+
+  # Cloud repository example (using rclone for OneDrive, Google Drive, etc.)
+  # Kopia writes to local_destination_repo, then rclone syncs to remote_destination_repo.
+  #
+  # Prerequisites:
+  #   1. Install rclone: https://rclone.org/downloads/
+  #   2. Configure the remote: rclone config
+  #   3. Test connectivity: rclone lsd onedrive:
+  #
+  # - name: cloud-backup
+  #   local_destination_repo: C:/kopia-cache/mysrc                   # Where Kopia writes locally
+  #   remote_destination_repo: onedrive:mybackups/kopia/mysrc        # rclone sync destination
+  #   local_config_file_path: C:/kopia-cache/mysrc/repository.config
+  #   password: your_password_here
+  #
+  #   sources:
+  #     - C:/Users/username/Documents
+  #
+  #   policies:
+  #     keep-annual: 1
+  #     keep-monthly: 12
+  #     keep-daily: 30
+  #     keep-hourly: 72
+  #     keep-latest: 100
+  #     snapshot-interval: 10m
+  #     remote-copy-interval: 60m    # How often to sync to cloud (default: 1 hour)
+  #     snapshot-mode: VSS

@@ -1,0 +1,88 @@
+# Kopia Backup Configuration Template
+# Copy this file to kopia-configs.yaml and customize for your setup
+#
+
+# Global settings for scheduled tasks and health monitoring
+settings:
+  # How often kopia-start-backups.py runs (Windows Task Scheduler)
+  # Default: 15 minutes
+  # backup_interval_minutes: 15
+
+  # How often kopia-health-check.py runs (Windows Task Scheduler)
+  # Default: 180 minutes (3 hours)
+  # health_check_interval_minutes: 180
+
+  # Alert if no backup activity for this many minutes (repo is "stale")
+  # Default: 10080 minutes (7 days)
+  # health_check_stale_minutes: 10080
+
+  # Health check mode:
+  #   'all' - Warn only if ALL checked repos have no recent backups (default)
+  #   'any' - Warn if ANY checked repo has no recent backup
+  # health_check_mode: all
+
+  # Optional: Comma-separated list of repo names to check
+  # If not specified, all repos are checked
+  # health_check_repos: my-backup1,my-backup2
+
+  # Directories to aggregate in health check --details output
+  # Changes in these dirs are summarized instead of listed individually
+  # Uses .gitignore syntax (trailing slash = directories only)
+  # aggregate:
+  #   - ".git/"
+  #   - "_vimbackup/"
+  #   - "__pycache__/"
+
+repositories:
+  - name: my-backup1
+    repository_path: /path/to/backup/destination1
+    config_file_path: /path/to/backup/destination1/repository.config
+    password: your_password1_here  # or set via env var (see README for details)
+
+    sources:
+      - /path/to/source/folder1
+      - /path/to/source/folder2
+
+    policies:
+      # Retention policy - snapshots kept using UNION (OR) logic
+      # A snapshot is kept if it matches ANY of these rules:
+
+      keep-annual: 1      # Keep 1 snapshot per year (oldest each year)
+      keep-monthly: 12    # and Keep 1 snapshot per month for 12 months (oldest each month)
+      keep-daily: 30      # and Keep 1 snapshot per day for 30 days (oldest each day)
+      keep-hourly: 72     # and Keep 1 snapshot per hour for 72 hours / 3 days (oldest each hour)
+      keep-latest: 100    # and Keep latest 100 snapshots (~25 hours at 15min snapshot intervals)
+      
+      # Snapshot interval - minimum time between snapshots
+      # If Kopia is triggered before this interval, it will skip creating a snapshot
+      # In reality we setup up Task Scheduler to run every 15 minutes, so this is just a safety-catch
+      snapshot-interval: 10m
+      
+      # Snapshot mode - VSS (Volume Shadow Copy) for Windows
+      snapshot-mode: VSS
+      
+      # Ignore patterns - files/directories to exclude from backups
+      # Uses .gitignore syntax - see https://kopia.io/docs/advanced/kopiaignore/
+      # ignore:
+      #   - "__pycache__/"  # Python cache directories (trailing slash = dirs only)
+      #   - "*.pyc"         # Python bytecode files
+      #   - "*.tmp"         # Temporary files
+
+  # Add more repositories as needed, e.g.:
+  - name: backup2
+    repository_path: /path/to/backup/destination2
+    config_file_path: /path/to/backup/destination2/repository.config
+    password: your_password2_here  # or set via env var (see README for details)
+
+    sources:
+      - /path/to/source/folder3
+      - /path/to/source/folder4
+
+    policies:
+      keep-annual: 1
+      keep-monthly: 12
+      keep-daily: 30
+      keep-hourly: 72
+      keep-latest: 100
+      snapshot-interval: 10m
+      snapshot-mode: VSS  # Windows only

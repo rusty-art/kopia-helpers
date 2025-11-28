@@ -1,0 +1,10 @@
+# Environment files with secrets
+.env
+.env.local
+
+# User config that might store with passwords
+kopia-configs.yaml
+
+# Python
+__pycache__/
+*.pyc

@@ -1,6 +1,7 @@
 # Kopia Backup Scripts
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Tests](https://github.com/rusty-art/kopia-helpers/actions/workflows/tests.yml/badge.svg)](https://github.com/rusty-art/kopia-helpers/actions/workflows/tests.yml)
 
 **Multi-repository backup automation for [Kopia](https://kopia.io/).**
 

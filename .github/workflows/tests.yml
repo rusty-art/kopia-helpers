@@ -1,0 +1,45 @@
+name: Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install Kopia via Scoop
+      shell: pwsh
+      run: |
+        # Install Scoop if not present
+        if (!(Get-Command scoop -ErrorAction SilentlyContinue)) {
+          Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+          Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+        }
+        # Add Kopia bucket and install
+        scoop bucket add kopia https://github.com/kopia/scoop-bucket.git
+        scoop install kopia
+
+    - name: Verify Kopia installation
+      run: kopia --version
+
+    - name: Install Python dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pytest pyyaml python-dotenv
+
+    - name: Run tests
+      run: pytest -v

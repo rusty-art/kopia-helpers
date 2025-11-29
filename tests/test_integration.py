@@ -38,7 +38,7 @@ class TestIntegration:
         
         # 3. Verify Snapshot exists
         success, stdout, _, _ = runner.run(
-            ["snapshot", "list", "--json", "--config-file", repo_config['local_config_file_path']],
+            ["snapshot", "list", "--json", "--config-file", repo_config['repo_config']],
             repo_config=repo_config
         )
         assert success

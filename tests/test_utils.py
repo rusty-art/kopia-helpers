@@ -40,7 +40,7 @@ class TestUtils:
         runner = utils.KopiaRunner(skip_config=True)
         
         # Test explicit config
-        config = {'name': 'test', 'password': 'explicit-pass'}
+        config = {'name': 'test', 'repo_password': 'explicit-pass'}
         assert runner.get_password(config) == 'explicit-pass'
         
         # Test ENV var

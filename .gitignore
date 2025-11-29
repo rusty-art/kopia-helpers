@@ -2,8 +2,8 @@
 .env
 .env.local
 
-# User config that might store with passwords
-kopia-configs.yaml
+# User config that might contain passwords
+kopia-helpers.yaml
 
 # Python
 __pycache__/

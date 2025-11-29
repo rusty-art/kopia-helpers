@@ -24,14 +24,14 @@ Usage:
     python kopia-health-check.py --no-toast           # Health check: Print instead of toast
     python kopia-health-check.py --register           # Register scheduled task
 
-Configuration (kopia-configs.yaml):
+Configuration (kopia-helpers.yaml):
     health_check_stale_minutes: 10080        (default: 7 days)
     health_check_interval_minutes: 180       (default: 3 hours)
     health_check_mode: all|any               (default: all)
     health_check_repos: repo1,repo2          (optional)
 
 Requires:
-    - kopia-configs.yaml
+    - kopia-helpers.yaml
     - kopia CLI in PATH
 """
 import json
@@ -51,7 +51,7 @@ EXIT_TOOL_ERROR = 1       # Missing tools (kopia not installed)
 EXIT_HEALTH_WARNING = 2   # Health check found issues (stale backups, failures)
 EXIT_CONFIG_ERROR = 3     # Configuration errors
 
-# Defaults (can be overridden in kopia-configs.yaml)
+# Defaults (can be overridden in kopia-helpers.yaml)
 DEFAULT_STALE_MINUTES = 10080  # 7 days
 DEFAULT_INTERVAL_MINUTES = 180  # 3 hours
 TASK_NAME = "KopiaHelperHealth"
@@ -115,7 +115,7 @@ def match_aggregated_dir(path: str) -> Optional[str]:
 
 def get_latest_snapshot_time(runner: utils.KopiaRunner, repo_config: Dict[str, Any]) -> Tuple[Optional[datetime], Optional[str]]:
     """Get the timestamp of the most recent snapshot for a repository."""
-    config_file = repo_config['local_config_file_path']
+    config_file = repo_config['repo_config']
 
     success, stdout, stderr, _ = runner.run(
         ["snapshot", "list", "--config-file", config_file, "--json"],
@@ -164,7 +164,7 @@ def check_recent_snapshots(
 
     for repo in repos:
         repo_name = repo.get('name', 'unknown')
-        config_file = repo['local_config_file_path']
+        config_file = repo['repo_config']
         repo_status[repo_name] = {'last_backup': None, 'error': None, 'snapshots_in_window': 0}
 
         success, stdout, stderr, _ = runner.run(
@@ -286,7 +286,7 @@ def check_all_repositories(
 
 def get_repository_size(runner: utils.KopiaRunner, repo_config: Dict[str, Any]) -> Optional[int]:
     """Get total repository disk size in bytes using blob stats --raw."""
-    config_file = repo_config['local_config_file_path']
+    config_file = repo_config['repo_config']
 
     success, stdout, stderr, _ = runner.run(
         ["blob", "stats", "--config-file", config_file, "--raw"],
@@ -324,33 +324,37 @@ def show_detailed_status(runner: utils.KopiaRunner, repo_config: Dict[str, Any],
     Returns the repository disk size in bytes, or None if unavailable.
     """
     name = repo_config['name']
-    config_file = repo_config['local_config_file_path']
-    repo_path = repo_config['local_destination_repo']
+    config_file = repo_config['repo_config']
+    repo_path = repo_config['repo_destination']
 
     print(f"\n{'='*20} {name} {'='*20}")
     print(f"Local Repository: {repo_path}")
     if utils.has_remote_destination(repo_config):
-        remote_dest = repo_config['remote_destination_repo']
         cloud_status = utils.load_cloud_sync_status()
-        repo_cloud = cloud_status.get(name, {})
+        sync_runner = utils.KopiaSyncRunner()
 
-        if repo_cloud:
-            if not repo_cloud.get('success', True):
-                print(f"Cloud Sync: [FAIL] FAILED -> {remote_dest}")
-                print(f"            Error: {repo_cloud.get('error', 'Unknown')}")
-            else:
-                last_sync_str = repo_cloud.get('last_sync')
-                if last_sync_str:
-                    try:
-                        last_sync = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
-                        sync_time = last_sync.astimezone().strftime("%Y-%m-%d %H:%M")
-                        print(f"Cloud Sync: [OK] [{sync_time}] -> {remote_dest}")
-                    except (ValueError, TypeError):
-                        print(f"Cloud Sync: [OK] -> {remote_dest}")
+        for dest_config in repo_config.get('sync-to', []):
+            dest_id = sync_runner.get_destination_id(dest_config)
+            key = f"{name}:{dest_id}"
+            dest_status = cloud_status.get(key, {})
+
+            if dest_status:
+                if not dest_status.get('success', True):
+                    print(f"Sync: [FAIL] {dest_id}")
+                    print(f"       Error: {dest_status.get('error', 'Unknown')}")
                 else:
-                    print(f"Cloud Sync: [OK] -> {remote_dest}")
-        else:
-            print(f"Cloud Sync: (no sync recorded) -> {remote_dest}")
+                    last_sync_str = dest_status.get('last_sync')
+                    if last_sync_str:
+                        try:
+                            last_sync = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
+                            sync_time = last_sync.astimezone().strftime("%Y-%m-%d %H:%M")
+                            print(f"Sync: [OK] [{sync_time}] {dest_id}")
+                        except (ValueError, TypeError):
+                            print(f"Sync: [OK] {dest_id}")
+                    else:
+                        print(f"Sync: [OK] {dest_id}")
+            else:
+                print(f"Sync: (no sync recorded) {dest_id}")
 
     # Get and display repository disk size
     repo_size = get_repository_size(runner, repo_config)
@@ -369,7 +373,7 @@ def show_detailed_status(runner: utils.KopiaRunner, repo_config: Dict[str, Any],
             print(f"  Details: {stderr.strip()}")
         print(f"\n  Troubleshooting:")
         print(f"    1. Verify config file exists: {config_file}")
-        print(f"    2. Check password in kopia-configs.yaml for '{name}'")
+        print(f"    2. Check password in kopia-helpers.yaml for '{name}'")
         print(f"    3. Verify local repository path exists: {repo_path}")
         return None
 
@@ -541,10 +545,10 @@ def check_cloud_sync_status(
     stale_threshold_minutes: int,
     repo_filter: Optional[List[str]] = None
 ) -> Tuple[List[Dict], List[Dict]]:
-    """Check cloud sync status for repositories with cloud destinations.
+    """Check cloud sync status for repositories with sync-to destinations.
 
     Returns:
-        Tuple of (failures, stale_syncs) where each is a list of dicts with repo info.
+        Tuple of (failures, stale_syncs) where each is a list of dicts with repo/dest info.
     """
     status = utils.load_cloud_sync_status()
     if not status:
@@ -555,43 +559,46 @@ def check_cloud_sync_status(
 
     failures = []
     stale_syncs = []
+    sync_runner = utils.KopiaSyncRunner()
 
-    # Get cloud repos from config (repos with remote_repository_path)
-    cloud_repos = []
+    # Check each repo's sync-to destinations
     for repo in config.get('repositories', []):
-        if utils.has_remote_destination(repo):
-            if repo_filter is None or repo['name'] in repo_filter:
-                cloud_repos.append(repo['name'])
-
-    for repo_name in cloud_repos:
-        if repo_name not in status:
-            # No sync status recorded - could be first run
+        repo_name = repo.get('name', 'unknown')
+        if repo_filter is not None and repo_name not in repo_filter:
             continue
 
-        repo_status = status[repo_name]
+        for dest_config in repo.get('sync-to', []):
+            dest_id = sync_runner.get_destination_id(dest_config)
+            key = f"{repo_name}:{dest_id}"
 
-        # Check for sync failures
-        if not repo_status.get('success', True):
-            failures.append({
-                'repo': repo_name,
-                'remote': repo_status.get('remote', 'unknown'),
-                'error': repo_status.get('error', 'Unknown error'),
-                'last_sync': repo_status.get('last_sync')
-            })
-        else:
-            # Check for stale syncs
-            last_sync_str = repo_status.get('last_sync')
-            if last_sync_str:
-                try:
-                    last_sync = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
-                    if last_sync < threshold:
-                        stale_syncs.append({
-                            'repo': repo_name,
-                            'remote': repo_status.get('remote', 'unknown'),
-                            'last_sync': last_sync
-                        })
-                except (ValueError, TypeError):
-                    pass
+            if key not in status:
+                # No sync status recorded - could be first run
+                continue
+
+            dest_status = status[key]
+
+            # Check for sync failures
+            if not dest_status.get('success', True):
+                failures.append({
+                    'repo': repo_name,
+                    'dest_id': dest_id,
+                    'error': dest_status.get('error', 'Unknown error'),
+                    'last_sync': dest_status.get('last_sync')
+                })
+            else:
+                # Check for stale syncs
+                last_sync_str = dest_status.get('last_sync')
+                if last_sync_str:
+                    try:
+                        last_sync = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
+                        if last_sync < threshold:
+                            stale_syncs.append({
+                                'repo': repo_name,
+                                'dest_id': dest_id,
+                                'last_sync': last_sync
+                            })
+                    except (ValueError, TypeError):
+                        pass
 
     return failures, stale_syncs
 
@@ -847,7 +854,7 @@ Examples:
             print(f"Cloud Sync Failed ({len(cloud_failures)})")
             print(sync_msg)
             for f in cloud_failures:
-                print(f"  - {f['repo']}: {f['error']} ({f['remote']})")
+                print(f"  - {f['repo']}: {f['error']} ({f['dest_id']})")
         else:
             show_toast_notification(f"[FAIL] Cloud Sync Failed ({len(cloud_failures)})", sync_msg)
 
@@ -872,11 +879,13 @@ Examples:
         now = datetime.now(timezone.utc)
         cloud_status = utils.load_cloud_sync_status()
 
-        # Build lookup for repos with cloud destinations
+        # Build lookup for repos with sync-to destinations
         cloud_repos_config = {}
+        sync_runner = utils.KopiaSyncRunner()
         for repo in config.get('repositories', []):
             if utils.has_remote_destination(repo):
-                cloud_repos_config[repo['name']] = repo.get('remote_destination_repo', '')
+                dest_ids = [sync_runner.get_destination_id(d) for d in repo.get('sync-to', [])]
+                cloud_repos_config[repo['name']] = dest_ids
 
         print(f"Checked {len(repo_status)} repo(s) for failures in last {check_interval} min:\n")
 
@@ -916,28 +925,30 @@ Examples:
                 else:
                     print(f"  {repo_name}: no snapshots found")
 
-            # Show cloud sync status for this repo (if it has cloud destination)
+            # Show cloud sync status for this repo (if it has sync-to destinations)
             if repo_name in cloud_repos_config:
-                remote_dest = cloud_repos_config[repo_name]
-                repo_cloud = cloud_status.get(repo_name, {})
+                dest_ids = cloud_repos_config[repo_name]
+                for dest_id in dest_ids:
+                    key = f"{repo_name}:{dest_id}"
+                    dest_status = cloud_status.get(key, {})
 
-                if repo_cloud:
-                    if not repo_cloud.get('success', True):
-                        print(f"    [cloud] [FAIL] FAILED -> {remote_dest}")
-                        print(f"            Error: {repo_cloud.get('error', 'Unknown')}")
-                    else:
-                        last_sync_str = repo_cloud.get('last_sync')
-                        if last_sync_str:
-                            try:
-                                last_sync = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
-                                sync_time = last_sync.astimezone().strftime("%H:%M")
-                                print(f"    [cloud] [OK] [{sync_time}] -> {remote_dest}")
-                            except (ValueError, TypeError):
-                                print(f"    [cloud] [OK] -> {remote_dest}")
+                    if dest_status:
+                        if not dest_status.get('success', True):
+                            print(f"    [sync] [FAIL] {dest_id}")
+                            print(f"           Error: {dest_status.get('error', 'Unknown')}")
                         else:
-                            print(f"    [cloud] [OK] -> {remote_dest}")
-                else:
-                    print(f"    [cloud] (no sync recorded) -> {remote_dest}")
+                            last_sync_str = dest_status.get('last_sync')
+                            if last_sync_str:
+                                try:
+                                    last_sync = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
+                                    sync_time = last_sync.astimezone().strftime("%H:%M")
+                                    print(f"    [sync] [OK] [{sync_time}] {dest_id}")
+                                except (ValueError, TypeError):
+                                    print(f"    [sync] [OK] {dest_id}")
+                            else:
+                                print(f"    [sync] [OK] {dest_id}")
+                    else:
+                        print(f"    [sync] (no sync recorded) {dest_id}")
 
     elif is_healthy and not recent_failures and not cloud_failures:
         if not args.scheduled and last_backup:

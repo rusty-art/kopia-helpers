@@ -2,18 +2,17 @@
 kopia_utils.py - Shared utilities for Kopia backup scripts.
 
 Provides common functionality used across all Kopia scripts:
-- Configuration loading from YAML (with path normalization and field name migration)
+- Configuration loading from YAML (with path normalization)
 - KopiaRunner class for command execution and password management
-- RcloneRunner class for cloud sync operations
-- Cloud path detection (is_cloud_path) and remote destination checking
+- KopiaSyncRunner class for repository sync-to operations
 - Timestamp formatting (local or UTC)
 - pythonw.exe detection for background task scheduling
 - Windows Task Scheduler registration
 
-Config field names (backwards compatible):
-    - local_destination_repo (or repository_path, destination_repo) - where Kopia writes locally
-    - local_config_file_path (or config_file_path) - Kopia config file
-    - remote_destination_repo - rclone destination for cloud sync (optional)
+Config field names:
+    - repo_destination - where Kopia writes locally
+    - repo_config - Kopia config file path
+    - sync-to - list of sync destinations (type, interval, extra-args)
 
 Password lookup order:
     1. yaml config: password field
@@ -40,8 +39,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 KOPIA_EXE = "kopia"
 RCLONE_EXE = "rclone"
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "kopia-configs.yaml")
-STATUS_FILE = os.path.join(Path.home(), ".kopia-status.json")
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "kopia-helpers.yaml")
+STATUS_FILE = os.path.join(Path.home(), ".kopia-helpers-status.json")
 
 
 def check_tool_available(tool_name: str) -> Tuple[bool, str]:
@@ -253,51 +252,49 @@ def is_cloud_path(path: str) -> bool:
 
 
 def has_remote_destination(repo_config: Dict[str, Any]) -> bool:
-    """Check if repository has a remote destination for cloud sync.
+    """Check if repository has any sync-to destinations configured.
 
     Args:
         repo_config: Repository configuration dict
 
     Returns:
-        True if remote_destination_repo is configured.
+        True if sync-to list is configured and non-empty.
     """
-    return bool(repo_config.get('remote_destination_repo'))
+    sync_to = repo_config.get('sync-to', [])
+    return bool(sync_to and len(sync_to) > 0)
 
 
 def get_local_repo_path(repo_config: Dict[str, Any]) -> str:
     """Get the local filesystem path where Kopia writes.
 
     Args:
-        repo_config: Repository configuration dict (uses local_destination_repo)
+        repo_config: Repository configuration dict (uses repo_destination)
 
     Returns:
         Filesystem path for Kopia repository.
     """
-    return repo_config.get('local_destination_repo', '')
+    return repo_config.get('repo_destination', '')
 
 
 def get_config_file_path(repo_config: Dict[str, Any]) -> str:
     """Get the config file path for a repository.
 
     Args:
-        repo_config: Repository configuration dict (uses local_config_file_path)
+        repo_config: Repository configuration dict (uses repo_config)
 
     Returns:
         Path to repository config file.
     """
-    return repo_config.get('local_config_file_path', '')
+    return repo_config.get('repo_config', '')
 
 
 # Valid field names for repository config (for validation)
 VALID_REPO_FIELDS = {
-    # Current field names
-    'name', 'local_destination_repo', 'local_config_file_path', 'remote_destination_repo',
-    'password', 'sources', 'policies',
-    # Backwards-compatible aliases
-    'repository_path', 'config_file_path', 'destination_repo',
+    'name', 'repo_destination', 'repo_config', 'repo_password',
+    'sources', 'policies', 'sync-to',
 }
 
-REQUIRED_REPO_FIELDS = {'name', 'local_destination_repo', 'local_config_file_path', 'sources'}
+REQUIRED_REPO_FIELDS = {'name', 'repo_destination', 'repo_config', 'sources'}
 
 
 def validate_source_paths(sources: List[str], repo_name: str) -> Tuple[bool, List[str]]:
@@ -321,10 +318,6 @@ def load_config(config_path: Optional[str] = None, validate_sources: bool = True
     """Load and parse the YAML config file.
 
     Normalizes all paths for the current OS (Windows/Linux).
-    Also normalizes field names for backwards compatibility:
-      - repository_path -> local_destination_repo
-      - config_file_path -> local_config_file_path
-
     Validates field names and required fields, exits with error on unknown fields.
     """
     if config_path is None:
@@ -334,7 +327,7 @@ def load_config(config_path: Optional[str] = None, validate_sources: bool = True
             config = yaml.safe_load(f)
     except FileNotFoundError:
         print(f"Error: Config file not found: {config_path}", file=sys.stderr)
-        print(f"  Copy kopia-configs.template.yaml to kopia-configs.yaml and edit it.", file=sys.stderr)
+        print(f"  Copy kopia-helpers.template.yaml to kopia-helpers.yaml and edit it.", file=sys.stderr)
         sys.exit(1)
     except yaml.YAMLError as e:
         print(f"Error: Invalid YAML in {config_path}", file=sys.stderr)
@@ -352,39 +345,17 @@ def load_config(config_path: Optional[str] = None, validate_sources: bool = True
             print(f"  Valid fields: {', '.join(sorted(VALID_REPO_FIELDS))}", file=sys.stderr)
             sys.exit(1)
 
-        # Backwards compatibility: accept both old and new field names
-        # Prefer new names if both are present
-
-        # repository_path -> local_destination_repo
-        if 'local_destination_repo' not in repo and 'repository_path' in repo:
-            repo['local_destination_repo'] = repo.pop('repository_path')
-        elif 'repository_path' in repo:
-            repo.pop('repository_path')  # Remove old name if new name exists
-
-        # destination_repo -> local_destination_repo
-        if 'local_destination_repo' not in repo and 'destination_repo' in repo:
-            repo['local_destination_repo'] = repo.pop('destination_repo')
-        elif 'destination_repo' in repo:
-            repo.pop('destination_repo')  # Remove old name if new name exists
-
-        # config_file_path -> local_config_file_path
-        if 'local_config_file_path' not in repo and 'config_file_path' in repo:
-            repo['local_config_file_path'] = repo.pop('config_file_path')
-        elif 'config_file_path' in repo:
-            repo.pop('config_file_path')  # Remove old name if new name exists
-
-        # Check required fields (after normalization)
+        # Check required fields
         missing_fields = REQUIRED_REPO_FIELDS - set(repo.keys())
         if missing_fields:
             print(f"Error: Missing required field(s) in repository '{repo_name}': {', '.join(sorted(missing_fields))}", file=sys.stderr)
             sys.exit(1)
 
         # Normalize paths for current OS
-        if 'local_destination_repo' in repo:
-            repo['local_destination_repo'] = os.path.normpath(repo['local_destination_repo'])
-        if 'local_config_file_path' in repo:
-            repo['local_config_file_path'] = os.path.normpath(repo['local_config_file_path'])
-        # remote_destination_repo is a cloud path (rclone), don't normalize
+        if 'repo_destination' in repo:
+            repo['repo_destination'] = os.path.normpath(repo['repo_destination'])
+        if 'repo_config' in repo:
+            repo['repo_config'] = os.path.normpath(repo['repo_config'])
         if 'sources' in repo:
             repo['sources'] = [os.path.normpath(s) for s in repo['sources']]
 
@@ -515,7 +486,7 @@ class KopiaRunner:
         global_key = 'KOPIA_PASSWORD'
 
         # 1. Check yaml config first (explicit config wins)
-        password = repo_config.get('password')
+        password = repo_config.get('repo_password')
         if password:
             return password
 
@@ -557,7 +528,7 @@ class KopiaRunner:
 
         # 8. Not found
         print(f"Error: No password found for repository '{repo_name}'", file=sys.stderr)
-        print(f"  Set password in kopia-configs.yaml, environment variables, or .env/.env.local files.", file=sys.stderr)
+        print(f"  Set password in kopia-helpers.yaml, environment variables, or .env/.env.local files.", file=sys.stderr)
         print(f"  See README.md for details.", file=sys.stderr)
         return None
 
@@ -768,13 +739,56 @@ def register_scheduled_task(
         return False
 
 
-class RcloneRunner:
-    """Handles rclone command execution for cloud sync operations."""
+class KopiaSyncRunner:
+    """Handles kopia repository sync-to operations for syncing to remote destinations."""
+
+    # Backends that should use --flat flag (cloud storage)
+    CLOUD_BACKENDS = {'rclone', 's3', 'gcs', 'azure', 'b2', 'gdrive'}
+
+    # Required parameters for each backend type
+    BACKEND_PARAMS = {
+        'rclone': {'required': ['remote-path'], 'cmd_prefix': ['--remote-path=']},
+        's3': {'required': ['bucket'], 'cmd_prefix': ['--bucket=']},
+        'gcs': {'required': ['bucket'], 'cmd_prefix': ['--bucket=']},
+        'azure': {'required': ['container', 'storage-account'], 'cmd_prefix': ['--container=', '--storage-account=']},
+        'b2': {'required': ['bucket'], 'cmd_prefix': ['--bucket=']},
+        'gdrive': {'required': ['folder-id'], 'cmd_prefix': ['--folder-id=']},
+        'filesystem': {'required': ['path'], 'cmd_prefix': ['--path=']},
+        'sftp': {'required': ['path', 'host', 'username'], 'cmd_prefix': ['--path=', '--host=', '--username=']},
+        'webdav': {'required': ['url'], 'cmd_prefix': ['--url=']},
+    }
 
     def __init__(self):
-        self._rclone_not_found_warned = False
+        self._warned_remotes = set()
 
-    def check_remote_configured(self, remote_name: str) -> bool:
+    @staticmethod
+    def get_destination_id(dest_config: Dict[str, Any]) -> str:
+        """Generate a unique identifier for a sync destination.
+
+        Args:
+            dest_config: Destination configuration dict
+
+        Returns:
+            A string identifier like 'rclone:onedrive:mybackups' or 's3:my-bucket'
+        """
+        dest_type = dest_config.get('type', 'unknown')
+        if dest_type == 'rclone':
+            return f"rclone:{dest_config.get('remote-path', 'unknown')}"
+        elif dest_type in ('s3', 'gcs', 'b2'):
+            return f"{dest_type}:{dest_config.get('bucket', 'unknown')}"
+        elif dest_type == 'azure':
+            return f"azure:{dest_config.get('container', 'unknown')}"
+        elif dest_type == 'gdrive':
+            return f"gdrive:{dest_config.get('folder-id', 'unknown')}"
+        elif dest_type == 'filesystem':
+            return f"filesystem:{dest_config.get('path', 'unknown')}"
+        elif dest_type == 'sftp':
+            return f"sftp:{dest_config.get('host', 'unknown')}:{dest_config.get('path', '')}"
+        elif dest_type == 'webdav':
+            return f"webdav:{dest_config.get('url', 'unknown')}"
+        return f"{dest_type}:unknown"
+
+    def check_rclone_remote_configured(self, remote_name: str) -> bool:
         """Check if an rclone remote is configured.
 
         Args:
@@ -784,7 +798,6 @@ class RcloneRunner:
             True if remote is configured, False otherwise.
         """
         try:
-            # CREATE_NO_WINDOW prevents console popup on Windows during scheduled runs
             creation_flags = 0x08000000 if sys.platform == "win32" else 0
             result = subprocess.run(
                 [RCLONE_EXE, "listremotes"],
@@ -795,61 +808,125 @@ class RcloneRunner:
             )
             if result.returncode != 0:
                 return False
-            # listremotes outputs "remotename:" on each line
             configured_remotes = [line.rstrip(':') for line in result.stdout.strip().split('\n') if line]
             return remote_name in configured_remotes
         except FileNotFoundError:
-            if not self._rclone_not_found_warned:
+            if 'rclone' not in self._warned_remotes:
                 logging.error("rclone not found. Install from https://rclone.org/downloads/")
-                self._rclone_not_found_warned = True
+                self._warned_remotes.add('rclone')
             return False
         except Exception as e:
             logging.error(f"Error checking rclone remotes: {e}")
             return False
 
+    def build_sync_command(
+        self,
+        dest_config: Dict[str, Any],
+        config_file: str,
+        password: str,
+        dry_run: bool = False
+    ) -> Tuple[Optional[List[str]], Optional[str]]:
+        """Build the kopia repository sync-to command.
+
+        Args:
+            dest_config: Destination configuration dict with 'type' and backend-specific params
+            config_file: Path to kopia config file
+            password: Repository password
+            dry_run: If True, add --dry-run flag
+
+        Returns:
+            (command_list, error_message) - command_list is None if there's an error
+        """
+        dest_type = dest_config.get('type')
+        if not dest_type:
+            return None, "Missing 'type' in sync-to destination"
+
+        if dest_type not in self.BACKEND_PARAMS:
+            return None, f"Unknown sync-to type: {dest_type}"
+
+        backend_info = self.BACKEND_PARAMS[dest_type]
+
+        # Check required parameters
+        missing = [p for p in backend_info['required'] if p not in dest_config]
+        if missing:
+            return None, f"Missing required parameters for {dest_type}: {', '.join(missing)}"
+
+        # Build command
+        cmd = [
+            KOPIA_EXE,
+            f"--config-file={config_file}",
+            f"--password={password}",
+            "repository", "sync-to", dest_type
+        ]
+
+        # Add required backend parameters
+        for param, prefix in zip(backend_info['required'], backend_info['cmd_prefix']):
+            cmd.append(f"{prefix}{dest_config[param]}")
+
+        # Add default flags
+        cmd.append("--delete")  # Mirror behavior
+
+        # Add --flat for cloud backends
+        if dest_type in self.CLOUD_BACKENDS:
+            cmd.append("--flat")
+
+        # Add dry-run if requested
+        if dry_run:
+            cmd.append("--dry-run")
+
+        # Append extra-args at the end (allows overriding defaults)
+        extra_args = dest_config.get('extra-args', [])
+        if extra_args:
+            cmd.extend(extra_args)
+
+        return cmd, None
+
     def sync(
         self,
-        local_path: str,
-        remote: str,
+        dest_config: Dict[str, Any],
+        config_file: str,
+        password: str,
         quiet: bool = False,
         dry_run: bool = False
     ) -> Tuple[bool, str]:
-        """Sync local path to remote using rclone sync.
+        """Sync repository to a destination using kopia repository sync-to.
 
         Args:
-            local_path: Local filesystem path to sync from
-            remote: Remote destination (e.g., 'onedrive:Backups/kopia')
+            dest_config: Destination configuration dict
+            config_file: Path to kopia config file
+            password: Repository password
             quiet: If True, minimal output (for scheduled runs)
             dry_run: If True, simulate without making changes
 
         Returns:
             (success, error_message) tuple
         """
-        cmd = [
-            RCLONE_EXE, "sync",
-            local_path, remote,
-            "--transfers=4",
-            "--checkers=8",
-            "--retries=3",
-            "--low-level-retries=10",
-        ]
+        dest_type = dest_config.get('type', 'unknown')
 
-        if quiet:
-            cmd.append("--quiet")
-        else:
-            cmd.extend(["--stats=30s", "--progress"])
+        # For rclone backend, verify remote is configured
+        if dest_type == 'rclone':
+            remote_path = dest_config.get('remote-path', '')
+            remote_name = remote_path.split(':')[0] if ':' in remote_path else remote_path
+            if not self.check_rclone_remote_configured(remote_name):
+                return False, f"rclone remote '{remote_name}' not configured"
 
-        if dry_run:
-            cmd.append("--dry-run")
-            logging.info(f"[DRY-RUN] Would execute: {subprocess.list2cmdline(cmd)}")
-            return True, ""
+        # Build command
+        cmd, error = self.build_sync_command(dest_config, config_file, password, dry_run)
+        if cmd is None or error:
+            return False, error or "Unknown error building command"
 
-        logging.debug(f"Executing: {subprocess.list2cmdline(cmd)}")
+        # Mask password in logs
+        cmd_display = [c if not c.startswith('--password=') else '--password=***' for c in cmd]
+        logging.debug(f"Executing: {subprocess.list2cmdline(cmd_display)}")
+
+        if dry_run and not quiet:
+            print(f"[DRY-RUN] Would execute: {subprocess.list2cmdline(cmd_display)}")
 
         try:
+            creation_flags = 0x08000000 if sys.platform == "win32" else 0
+
             if quiet:
                 # Scheduled mode: capture output, hide window
-                creation_flags = 0x08000000 if sys.platform == "win32" else 0
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -860,50 +937,43 @@ class RcloneRunner:
                 if result.returncode == 0:
                     return True, ""
                 else:
-                    error_msg = result.stderr.strip() or f"rclone exited with code {result.returncode}"
+                    error_msg = result.stderr.strip() or result.stdout.strip() or f"kopia exited with code {result.returncode}"
                     return False, error_msg
             else:
-                # Interactive mode: let output flow to terminal for progress display
+                # Interactive mode: let output flow to terminal
                 result = subprocess.run(cmd)
                 if result.returncode == 0:
                     return True, ""
                 else:
-                    return False, f"rclone exited with code {result.returncode}"
+                    return False, f"kopia exited with code {result.returncode}"
 
         except KeyboardInterrupt:
             logging.warning("Sync interrupted")
             return False, "Sync interrupted by user"
         except FileNotFoundError:
-            if not self._rclone_not_found_warned:
-                logging.error("rclone not found. Install from https://rclone.org/downloads/")
-                self._rclone_not_found_warned = True
-            return False, "rclone_not_found"
+            return False, "kopia not found in PATH"
         except Exception as e:
             return False, str(e)
 
     @staticmethod
-    def get_setup_instructions(remote_type: str = "onedrive") -> str:
-        """Get setup instructions for configuring an rclone remote.
+    def get_setup_instructions(dest_type: str) -> str:
+        """Get setup instructions for a destination type.
 
         Args:
-            remote_type: Type of remote (default: 'onedrive')
+            dest_type: Type of destination (e.g., 'rclone', 's3')
 
         Returns:
             Multi-line instruction string.
         """
-        if remote_type == "onedrive":
+        if dest_type == 'rclone':
             return """
-To set up OneDrive with rclone:
-  1. Run: rclone config
-  2. Choose 'n' for new remote
-  3. Name it: onedrive
-  4. Choose 'onedrive' as storage type
-  5. Follow the browser auth flow
-  6. Test with: rclone lsd onedrive:
-
-For detailed instructions: https://rclone.org/onedrive/
+To set up rclone:
+  1. Install: https://rclone.org/downloads/
+  2. Run: rclone config
+  3. Follow the auth flow for your provider
+  4. Test with: rclone lsd <remote>:
 """
-        return f"Run 'rclone config' to set up a '{remote_type}' remote."
+        return f"See: kopia repository sync-to {dest_type} --help"
 
 
 def _load_status_file() -> Dict[str, Any]:
@@ -954,15 +1024,15 @@ def load_cloud_sync_status() -> Dict[str, Any]:
 
 def update_cloud_sync_status(
     repo_name: str,
-    remote: str,
+    dest_id: str,
     success: bool,
     error: Optional[str] = None
 ) -> None:
-    """Update the cloud sync status for a repository.
+    """Update the cloud sync status for a repository destination.
 
     Args:
         repo_name: Name of the repository
-        remote: Remote destination (e.g., 'onedrive:Backups/kopia')
+        dest_id: Destination identifier (e.g., 'rclone:onedrive:mybackups')
         success: Whether the sync succeeded
         error: Error message if sync failed
     """
@@ -970,13 +1040,30 @@ def update_cloud_sync_status(
     if "cloud_sync" not in status:
         status["cloud_sync"] = {}
 
-    status["cloud_sync"][repo_name] = {
+    # Key is now repo_name:dest_id to support multiple destinations
+    key = f"{repo_name}:{dest_id}"
+    status["cloud_sync"][key] = {
         "last_sync": datetime.now(timezone.utc).isoformat(),
         "success": success,
-        "remote": remote,
+        "dest_id": dest_id,
         "error": error
     }
     _save_status_file(status)
+
+
+def get_sync_status_for_destination(repo_name: str, dest_id: str) -> Optional[Dict[str, Any]]:
+    """Get the sync status for a specific destination.
+
+    Args:
+        repo_name: Name of the repository
+        dest_id: Destination identifier
+
+    Returns:
+        Status dict or None if not found.
+    """
+    cloud_status = load_cloud_sync_status()
+    key = f"{repo_name}:{dest_id}"
+    return cloud_status.get(key)
 
 
 def cleanup_status_file(valid_repo_names: List[str]) -> None:
@@ -989,10 +1076,17 @@ def cleanup_status_file(valid_repo_names: List[str]) -> None:
     changed = False
 
     if "cloud_sync" in status:
-        stale_repos = [name for name in status["cloud_sync"] if name not in valid_repo_names]
-        for name in stale_repos:
-            del status["cloud_sync"][name]
-            logging.debug(f"Cleaned up stale status for '{name}'")
+        # Keys are composite: "repo_name:dest_id" - check if repo_name prefix is valid
+        def is_valid_key(key: str) -> bool:
+            for repo_name in valid_repo_names:
+                if key == repo_name or key.startswith(f"{repo_name}:"):
+                    return True
+            return False
+
+        stale_keys = [key for key in status["cloud_sync"] if not is_valid_key(key)]
+        for key in stale_keys:
+            del status["cloud_sync"][key]
+            logging.debug(f"Cleaned up stale status for '{key}'")
             changed = True
 
     if changed:

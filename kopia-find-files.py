@@ -30,7 +30,7 @@ Usage:
     python kopia-find-files.py --mount Z: --repo myrepo   # Mount for browsing
 
 Requires:
-    - kopia-configs.yaml with repository definitions
+    - kopia-helpers.yaml with repository definitions
     - Password configured via yaml, environment variable, or .env file
     - kopia CLI installed and in PATH
     - WinFsp for mount functionality (Windows)
@@ -100,7 +100,7 @@ def parse_ls_line(line: str) -> Optional[Tuple[int, str, str]]:
 def find_in_repo(runner: utils.KopiaRunner, repo_config: Dict[str, Any], filename_pattern: str, max_snapshots: Optional[int] = None, match_path: bool = False, verbose: bool = False) -> List[Dict[str, Any]]:
     """Search for files using kopia ls -l -r (gets file details directly, no mounting)."""
     name = repo_config['name']
-    config_file = repo_config['local_config_file_path']
+    config_file = repo_config['repo_config']
 
     print(f"  Searching in {name}...")
 
@@ -193,7 +193,7 @@ def find_in_repo(runner: utils.KopiaRunner, repo_config: Dict[str, Any], filenam
 
 def mount_repository(runner: utils.KopiaRunner, repo_config: Dict[str, Any], drive_letter: str, verbose: bool = False):
     name = repo_config['name']
-    config_file = repo_config['local_config_file_path']
+    config_file = repo_config['repo_config']
 
     print(f"\nPreparing to mount '{name}' to {drive_letter}...")
 
@@ -278,7 +278,7 @@ def find_free_drive_letter() -> Optional[str]:
 def list_repositories(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     print("\nAvailable Repositories:")
     for i, repo in enumerate(config['repositories']):
-        print(f"[{i}] {repo['name']} ({repo['local_destination_repo']})")
+        print(f"[{i}] {repo['name']} ({repo['repo_destination']})")
     return config['repositories']
 
 

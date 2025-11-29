@@ -20,7 +20,7 @@ Usage:
 On first admin run, auto-registers 'KopiaHelperBackup' task to run every 15 minutes.
 
 Requires:
-    - kopia-configs.yaml with repository definitions
+    - kopia-helpers.yaml with repository definitions
     - Password configured via yaml, environment variable, or .env file
     - kopia CLI installed and in PATH
     - Admin rights for VSS and Task Scheduler
@@ -34,7 +34,7 @@ from typing import Dict, Any, List, Tuple
 
 # Logging configured in main() after argument parsing
 
-# Default (can be overridden in kopia-configs.yaml under 'settings')
+# Default (can be overridden in kopia-helpers.yaml under 'settings')
 DEFAULT_BACKUP_INTERVAL_MINUTES = 15
 TASK_NAME = "KopiaHelperBackup"
 
@@ -58,11 +58,15 @@ def preflight_checks(config: Dict[str, Any], runner: utils.KopiaRunner) -> Tuple
     errors = []
     warnings = []
 
-    # Check if any repo needs rclone
-    needs_rclone = any(
-        utils.has_remote_destination(repo)
-        for repo in config.get('repositories', [])
-    )
+    # Check if any repo has sync-to destinations using rclone
+    needs_rclone = False
+    for repo in config.get('repositories', []):
+        for dest in repo.get('sync-to', []):
+            if dest.get('type') == 'rclone':
+                needs_rclone = True
+                break
+        if needs_rclone:
+            break
 
     # 1. Validate required tools
     tools_ok, tool_errors = utils.validate_required_tools(require_rclone=needs_rclone)
@@ -85,15 +89,17 @@ def preflight_checks(config: Dict[str, Any], runner: utils.KopiaRunner) -> Tuple
 
     # 4. If rclone is needed, validate remotes are configured
     if needs_rclone and tools_ok:
-        rclone = utils.RcloneRunner()
+        sync_runner = utils.KopiaSyncRunner()
         for repo in config.get('repositories', []):
-            if utils.has_remote_destination(repo):
-                remote_dest = repo.get('remote_destination_repo', '')
-                if ':' in remote_dest:
-                    remote_name = remote_dest.split(':')[0]
-                    if not rclone.check_remote_configured(remote_name):
-                        errors.append(f"ERROR: rclone remote '{remote_name}' is not configured for '{repo.get('name')}'")
-                        errors.append(f"  Run 'rclone config' to set up the '{remote_name}' remote.")
+            repo_name = repo.get('name', 'unknown')
+            for dest in repo.get('sync-to', []):
+                if dest.get('type') == 'rclone':
+                    remote_path = dest.get('remote-path', '')
+                    if ':' in remote_path:
+                        remote_name = remote_path.split(':')[0]
+                        if not sync_runner.check_rclone_remote_configured(remote_name):
+                            errors.append(f"ERROR: rclone remote '{remote_name}' not configured for '{repo_name}'")
+                            errors.append(f"  Run 'rclone config' to set up the '{remote_name}' remote.")
 
     # Print warnings (but don't fail)
     for warning in warnings:
@@ -104,8 +110,8 @@ def preflight_checks(config: Dict[str, Any], runner: utils.KopiaRunner) -> Tuple
 
 def ensure_repository_connected(runner: utils.KopiaRunner, repo_config: Dict[str, Any], dry_run: bool = False) -> bool:
     """Connects to the repository if not already connected."""
-    repo_path = repo_config['local_destination_repo']
-    config_file = repo_config['local_config_file_path']
+    repo_path = repo_config['repo_destination']
+    config_file = repo_config['repo_config']
 
     # Ensure config dir exists
     config_dir = os.path.dirname(config_file)
@@ -182,14 +188,15 @@ def run_backup_job(
     print(f"{'='*60}")
     print(f"Sources: {', '.join(sources)}")
     if has_cloud:
-        print(f"Cloud sync: {repo_config['remote_destination_repo']}")
+        sync_dests = [utils.KopiaSyncRunner.get_destination_id(d) for d in repo_config.get('sync-to', [])]
+        print(f"Sync destinations: {', '.join(sync_dests)}")
     print()
 
     if not ensure_repository_connected(runner, repo_config, dry_run):
         print(f"[ERROR] Skipping {repo_name} due to connection failure.")
         return False
 
-    config_file = repo_config['local_config_file_path']
+    config_file = repo_config['repo_config']
     policies = repo_config.get('policies', {})
 
     # Track errors per source
@@ -254,10 +261,10 @@ def run_backup_job(
         else:
             print(f"[kopia] Snapshot complete for {source}")
 
-    # 3. Sync to cloud if configured (remote_destination_repo is set)
+    # 3. Sync to destinations if configured (sync-to is set)
     cloud_success = True
     if has_cloud:
-        cloud_success = sync_to_cloud(repo_config, scheduled=scheduled, dry_run=dry_run)
+        cloud_success = sync_to_cloud(repo_config, runner, scheduled=scheduled, dry_run=dry_run)
 
     # Summarize results for this repo
     backup_success = len(snapshot_errors) == 0 and cloud_success
@@ -294,71 +301,79 @@ def parse_interval(interval_str: str) -> int:
         return int(interval_str)  # assume seconds
 
 
-def sync_to_cloud(repo_config: Dict[str, Any], scheduled: bool = False, dry_run: bool = False) -> bool:
-    """Sync local repository to remote destination using rclone.
+def sync_to_cloud(repo_config: Dict[str, Any], runner: utils.KopiaRunner, scheduled: bool = False, dry_run: bool = False) -> bool:
+    """Sync local repository to all configured destinations using kopia repository sync-to.
 
     Args:
         repo_config: Repository configuration dict
+        runner: KopiaRunner instance (for password lookup)
         scheduled: If True, quiet mode (no progress output)
         dry_run: If True, simulate without making changes
 
     Returns:
-        True if sync succeeded, or None if skipped due to interval.
+        True if all syncs succeeded (or were skipped), False if any failed.
     """
     from datetime import datetime, timezone
 
     repo_name = repo_config['name']
-    policies = repo_config.get('policies', {})
-    interval_str = policies.get('remote-copy-interval', '60m')  # default 1 hour
-    interval_seconds = parse_interval(interval_str)
+    sync_destinations = repo_config.get('sync-to', [])
 
-    # Check if we should skip based on last sync time
-    cloud_status = utils.load_cloud_sync_status()
-    repo_cloud = cloud_status.get(repo_name, {})
-    if repo_cloud and repo_cloud.get('success', False):
-        last_sync_str = repo_cloud.get('last_sync')
-        if last_sync_str:
-            try:
-                last_sync = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
-                now = datetime.now(timezone.utc)
-                elapsed = (now - last_sync).total_seconds()
-                if elapsed < interval_seconds:
-                    remaining = int((interval_seconds - elapsed) / 60)
-                    print(f"[rclone] Skipping sync (last sync {int(elapsed/60)}m ago, interval {interval_str}, next in ~{remaining}m)")
-                    return True  # Not a failure, just skipped
-            except (ValueError, TypeError):
-                pass  # Can't parse, proceed with sync
+    if not sync_destinations:
+        return True  # No destinations configured, nothing to do
 
-    rclone = utils.RcloneRunner()
-    cloud_dest = repo_config['remote_destination_repo']
-    local_path = repo_config['local_destination_repo']
-    remote_name = cloud_dest.split(':')[0]
+    config_file = utils.get_config_file_path(repo_config)
+    password = runner.get_password(repo_config)
 
-    # Check if rclone remote is configured
-    if not rclone.check_remote_configured(remote_name):
-        print(f"[rclone] ERROR: Remote '{remote_name}' not configured.")
-        print(rclone.get_setup_instructions(remote_name))
-        utils.update_cloud_sync_status(
-            repo_config['name'], cloud_dest, success=False,
-            error=f"Remote '{remote_name}' not configured"
-        )
+    if not password:
+        print(f"[sync] ERROR: No password for repository '{repo_name}'")
         return False
 
-    print(f"\n[rclone] Syncing to {cloud_dest}...")
-    success, error = rclone.sync(local_path, cloud_dest, quiet=scheduled, dry_run=dry_run)
+    sync_runner = utils.KopiaSyncRunner()
+    all_success = True
 
-    # Update status file for health check
-    utils.update_cloud_sync_status(
-        repo_config['name'], cloud_dest, success=success,
-        error=error if not success else None
-    )
+    for dest_config in sync_destinations:
+        dest_id = sync_runner.get_destination_id(dest_config)
+        interval_str = dest_config.get('interval', '60m')  # default 1 hour
+        interval_seconds = parse_interval(interval_str)
 
-    if success:
-        print(f"[rclone] Sync complete.")
-    else:
-        print(f"[rclone] ERROR: {error}")
+        # Check if we should skip based on last sync time for this destination
+        dest_status = utils.get_sync_status_for_destination(repo_name, dest_id)
+        if dest_status and dest_status.get('success', False):
+            last_sync_str = dest_status.get('last_sync')
+            if last_sync_str:
+                try:
+                    last_sync = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
+                    now = datetime.now(timezone.utc)
+                    elapsed = (now - last_sync).total_seconds()
+                    if elapsed < interval_seconds:
+                        remaining = int((interval_seconds - elapsed) / 60)
+                        print(f"[sync] Skipping {dest_id} (last sync {int(elapsed/60)}m ago, next in ~{remaining}m)")
+                        continue  # Skip this destination, check next
+                except (ValueError, TypeError):
+                    pass  # Can't parse, proceed with sync
 
-    return success
+        print(f"\n[sync] Syncing to {dest_id}...")
+        success, error = sync_runner.sync(
+            dest_config=dest_config,
+            config_file=config_file,
+            password=password,
+            quiet=scheduled,
+            dry_run=dry_run
+        )
+
+        # Update status file for health check
+        utils.update_cloud_sync_status(
+            repo_name, dest_id, success=success,
+            error=error if not success else None
+        )
+
+        if success:
+            print(f"[sync] Sync to {dest_id} complete.")
+        else:
+            print(f"[sync] ERROR syncing to {dest_id}: {error}")
+            all_success = False
+
+    return all_success
 
 
 def register_backup_task(config: Dict[str, Any]) -> bool:
@@ -480,7 +495,7 @@ def main():
         if args.maintenance:
             logging.info(f"Running maintenance for {repo_name}...")
             maint_success, _, maint_stderr, _ = runner.run(
-                ["maintenance", "run", "--full", "--config-file", repo['local_config_file_path']],
+                ["maintenance", "run", "--full", "--config-file", repo['repo_config']],
                 repo_config=repo, dry_run=args.dry_run
             )
             if not maint_success:

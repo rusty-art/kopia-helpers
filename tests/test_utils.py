@@ -37,7 +37,7 @@ class TestUtils:
         assert clean_simple == "2025-11-22 16:09:30 +1100"
 
     def test_get_password(self):
-        runner = utils.KopiaRunner()
+        runner = utils.KopiaRunner(skip_config=True)
         
         # Test explicit config
         config = {'name': 'test', 'password': 'explicit-pass'}

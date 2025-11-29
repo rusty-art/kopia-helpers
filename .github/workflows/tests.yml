@@ -29,9 +29,14 @@ jobs:
           Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
           Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
         }
+        # Add Scoop shims to PATH for subsequent steps
+        $scoopShims = "$env:USERPROFILE\scoop\shims"
+        echo "$scoopShims" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         # Add Kopia bucket and install
         scoop bucket add kopia https://github.com/kopia/scoop-bucket.git
         scoop install kopia
+        # Verify immediately (shims dir already in current session)
+        & "$scoopShims\kopia.exe" --version
 
     - name: Verify Kopia installation
       run: kopia --version

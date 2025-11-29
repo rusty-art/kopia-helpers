@@ -19,7 +19,7 @@ kopia_find = import_script("kopia-find-files.py")
 class TestIntegration:
     def test_backup_lifecycle(self, temp_repo):
         """Test init, backup, and find flow."""
-        runner = utils.KopiaRunner()
+        runner = utils.KopiaRunner(skip_config=True)
         repo_config = temp_repo['config']
         source_dir = temp_repo['source_dir']
         
@@ -38,7 +38,7 @@ class TestIntegration:
         
         # 3. Verify Snapshot exists
         success, stdout, _, _ = runner.run(
-            ["snapshot", "list", "--json", "--config-file", repo_config['config_file_path']],
+            ["snapshot", "list", "--json", "--config-file", repo_config['local_config_file_path']],
             repo_config=repo_config
         )
         assert success
@@ -51,7 +51,7 @@ class TestIntegration:
         assert matches[0]['size'] == 11  # "Hello Kopia" is 11 bytes
 
     def test_incremental_backup(self, temp_repo):
-        runner = utils.KopiaRunner()
+        runner = utils.KopiaRunner(skip_config=True)
         repo_config = temp_repo['config']
         source_dir = temp_repo['source_dir']
         

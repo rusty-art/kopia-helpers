@@ -24,8 +24,8 @@ def temp_repo():
     
     repo_config = {
         'name': 'test-repo',
-        'repository_path': repo_path,
-        'config_file_path': config_file,
+        'local_destination_repo': repo_path,
+        'local_config_file_path': config_file,
         'password': 'test-password',
         'sources': [source_dir]
     }

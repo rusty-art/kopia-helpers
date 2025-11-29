@@ -400,8 +400,8 @@ def load_config(config_path: Optional[str] = None, validate_sources: bool = True
 class KopiaRunner:
     """Handles Kopia command execution and configuration."""
 
-    def __init__(self, config_path: Optional[str] = None):
-        self.config = load_config(config_path)
+    def __init__(self, config_path: Optional[str] = None, skip_config: bool = False):
+        self.config = {} if skip_config else load_config(config_path)
         self._kopia_not_found_warned = False
 
     def run(

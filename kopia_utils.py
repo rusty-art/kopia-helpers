@@ -870,6 +870,13 @@ class KopiaSyncRunner:
         if dest_type in self.CLOUD_BACKENDS:
             cmd.append("--flat")
 
+        # Workaround for kopia/rclone startup detection issue:
+        # Kopia detects rclone startup by parsing its stderr for specific strings.
+        # Recent rclone versions may not output these by default, causing timeout.
+        # --rclone-debug enables verbose rclone output that kopia can detect.
+        if dest_type == 'rclone':
+            cmd.append("--rclone-debug")
+
         # Add dry-run if requested
         if dry_run:
             cmd.append("--dry-run")

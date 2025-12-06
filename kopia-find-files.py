@@ -378,29 +378,35 @@ def main():
     print(f"\nSearching for files matching: {args.pattern}")
 
     all_matches = []
+    header_printed = False
+
     for repo in repos:
         matches = find_in_repo(runner, repo, args.pattern, max_snapshots=max_snapshots, match_path=args.path, verbose=args.verbose)
-        all_matches.extend(matches)
+
+        if matches:
+            # Print header on first results
+            if not header_printed:
+                print(f"\n{'='*115}")
+                print(f"{'#':<4} {'Modified':<26} {'Size (KB)':>14} {'Repo':<12} {'Path'}")
+                print(f"{'-'*115}")
+                header_printed = True
+
+            # Sort this repo's matches by modification time (newest first)
+            matches.sort(key=lambda x: x['modified'] or datetime.min, reverse=True)
+
+            # Print results immediately
+            for m in matches:
+                idx = len(all_matches)
+                size_kb = m['size'] / 1024
+                print(f"{idx:<4} {m['modified_str']:<26} {size_kb:>14.3f} {m['repo']:<12} {m['path']}")
+                all_matches.append(m)
 
     if not all_matches:
         print("\nNo matching files found.")
         return
 
-    # Sort by modification time (newest first), with None dates last
-    all_matches.sort(key=lambda x: x['modified'] or datetime.min, reverse=True)
-
-    # Display results
-    print(f"\n{'='*115}")
-    print(f"Found {len(all_matches)} version(s):")
     print(f"{'='*115}")
-    print(f"{'#':<4} {'Modified':<26} {'Size (KB)':>14} {'Repo':<12} {'Path'}")
-    print(f"{'-'*115}")
-
-    for i, m in enumerate(all_matches):
-        size_kb = m['size'] / 1024
-        print(f"{i:<4} {m['modified_str']:<26} {size_kb:>14.3f} {m['repo']:<12} {m['path']}")
-
-    print(f"{'='*115}")
+    print(f"Found {len(all_matches)} version(s)")
 
     # Skip mount prompt unless --mount flag provided
     if not args.mount:

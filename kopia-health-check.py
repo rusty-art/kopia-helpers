@@ -540,6 +540,99 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         print(f"Message: {message}")
 
 
+def diagnose_rclone_issues(dest_id: str) -> List[str]:
+    """Run rclone diagnostics when sync failures are detected.
+
+    Returns list of diagnostic messages.
+    """
+    diagnostics = []
+
+    # Extract remote name from dest_id like "rclone:onedrive:mybackups/..."
+    if not dest_id.startswith('rclone:'):
+        return diagnostics
+
+    remote_path = dest_id[7:]  # Strip "rclone:" prefix
+    remote_name = remote_path.split(':')[0] if ':' in remote_path else remote_path
+
+    # Check 1: Is rclone in PATH?
+    try:
+        creation_flags = 0x08000000 if sys.platform == "win32" else 0
+        result = subprocess.run(
+            [utils.RCLONE_EXE, "version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=creation_flags
+        )
+        if result.returncode == 0:
+            version_line = result.stdout.strip().split('\n')[0]
+            diagnostics.append(f"  rclone: OK ({version_line})")
+        else:
+            diagnostics.append(f"  rclone: FAILED to run (exit {result.returncode})")
+            return diagnostics
+    except FileNotFoundError:
+        diagnostics.append("  rclone: NOT FOUND in PATH")
+        return diagnostics
+    except subprocess.TimeoutExpired:
+        diagnostics.append("  rclone: TIMEOUT running 'rclone version'")
+        return diagnostics
+    except Exception as e:
+        diagnostics.append(f"  rclone: ERROR - {e}")
+        return diagnostics
+
+    # Check 2: List configured remotes
+    try:
+        result = subprocess.run(
+            [utils.RCLONE_EXE, "listremotes"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            creationflags=creation_flags
+        )
+        if result.returncode == 0:
+            remotes = [r.rstrip(':') for r in result.stdout.strip().split('\n') if r]
+            if remote_name in remotes:
+                diagnostics.append(f"  remote '{remote_name}': configured")
+            else:
+                diagnostics.append(f"  remote '{remote_name}': NOT CONFIGURED!")
+                diagnostics.append(f"  available remotes: {', '.join(remotes) if remotes else '(none)'}")
+                return diagnostics
+        else:
+            diagnostics.append(f"  listremotes: FAILED (exit {result.returncode})")
+            if result.stderr:
+                diagnostics.append(f"    {result.stderr.strip()}")
+            return diagnostics
+    except subprocess.TimeoutExpired:
+        diagnostics.append("  listremotes: TIMEOUT")
+        return diagnostics
+    except Exception as e:
+        diagnostics.append(f"  listremotes: ERROR - {e}")
+        return diagnostics
+
+    # Check 3: Try to list the remote root (verifies auth)
+    try:
+        result = subprocess.run(
+            [utils.RCLONE_EXE, "lsd", f"{remote_name}:", "--max-depth", "1"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=creation_flags
+        )
+        if result.returncode == 0:
+            diagnostics.append(f"  remote access: OK")
+        else:
+            diagnostics.append(f"  remote access: FAILED")
+            if result.stderr:
+                for line in result.stderr.strip().split('\n')[:5]:  # First 5 lines
+                    diagnostics.append(f"    {line}")
+    except subprocess.TimeoutExpired:
+        diagnostics.append("  remote access: TIMEOUT (auth may have expired)")
+    except Exception as e:
+        diagnostics.append(f"  remote access: ERROR - {e}")
+
+    return diagnostics
+
+
 def check_cloud_sync_status(
     config: Dict[str, Any],
     stale_threshold_minutes: int,
@@ -609,7 +702,7 @@ def register_health_task(config: Dict[str, Any], mode: str = 'all', repo_filter:
     check_interval = settings.get('health_check_interval_minutes', DEFAULT_INTERVAL_MINUTES)
     script_path = os.path.abspath(__file__)
 
-    extra_args = []
+    extra_args = ['--scheduled']  # Always pass --scheduled for registered tasks
     if mode == 'any':
         extra_args.append('--any')
     if repo_filter:
@@ -624,7 +717,7 @@ def register_health_task(config: Dict[str, Any], mode: str = 'all', repo_filter:
         task_name=TASK_NAME,
         script_path=script_path,
         interval_minutes=check_interval,
-        extra_args=extra_args if extra_args else None,
+        extra_args=extra_args,
         run_elevated=False
     )
 
@@ -662,7 +755,7 @@ Examples:
 
     # Options for --check
     parser.add_argument("--scheduled", action="store_true",
-                        help="Running from scheduler (silent unless warning)")
+                        help="Running from scheduler (use toast notifications, silent when healthy)")
     parser.add_argument("--no-toast", action="store_true",
                         help="Print warnings instead of toast notification")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -788,6 +881,26 @@ Examples:
     check_interval = settings.get('health_check_interval_minutes', DEFAULT_INTERVAL_MINUTES)
     recent_failures, all_snapshots, repo_status = check_recent_snapshots(runner, config, check_interval, repo_filter=repo_filter)
 
+    # Determine output mode: toast only when scheduled (unless --no-toast overrides)
+    use_toast = args.scheduled and not args.no_toast
+
+    # Check if backup schedule stopped
+    # Use health_check_interval as threshold - if computer was on long enough for
+    # this health check to run, it was on long enough for backups to have run
+    schedule_stopped = False
+    if last_backup is not None:
+        minutes_since = (datetime.now(timezone.utc) - last_backup).total_seconds() / 60
+        if minutes_since > check_interval:
+            schedule_stopped = True
+            hours_ago = minutes_since / 60
+            age_str = f"{hours_ago / 24:.1f} days" if hours_ago >= 24 else f"{hours_ago:.1f} hours"
+            sched_msg = f"Backups not running! Last: {age_str} ago"
+            if use_toast:
+                show_toast_notification("[WARN] Backup Schedule Stopped", sched_msg)
+            else:
+                print("Backup Schedule Warning")
+                print(sched_msg)
+
     # Handle stale repos warning
     if not is_healthy:
         if last_backup is None:
@@ -802,11 +915,11 @@ Examples:
             days_ago = (datetime.now(timezone.utc) - last_backup).days
             message = f"No backup activity in {days_ago} days!"
 
-        if args.no_toast:
+        if use_toast:
+            show_toast_notification("[WARN] Kopia Backup Warning", message)
+        else:
             print("Kopia Backup Warning")
             print(message)
-        else:
-            show_toast_notification("[WARN] Kopia Backup Warning", message)
 
     # Handle recent failures warning
     if recent_failures:
@@ -830,14 +943,14 @@ Examples:
                     failure_parts.append(f"{repo}: {len(reasons)} failures")
             failure_msg = "; ".join(failure_parts)
 
-        if args.no_toast:
+        if use_toast:
+            show_toast_notification(f"[FAIL] Kopia Backup Failed ({len(recent_failures)})", failure_msg)
+        else:
             print(f"Kopia Backup Failed ({len(recent_failures)})")
             print(failure_msg)
             for f in recent_failures:
                 local_time = f['time'].astimezone().strftime("%H:%M")
                 print(f"  - [{local_time}] {f['repo']}: {f['reason']} ({f['source']})")
-        else:
-            show_toast_notification(f"[FAIL] Kopia Backup Failed ({len(recent_failures)})", failure_msg)
 
     # Check cloud sync status
     stale_threshold = settings.get('health_check_stale_minutes', DEFAULT_STALE_MINUTES)
@@ -850,13 +963,24 @@ Examples:
         else:
             sync_msg = "; ".join(f"{f['repo']}: {f['error']}" for f in cloud_failures)
 
-        if args.no_toast:
+        if use_toast:
+            show_toast_notification(f"[FAIL] Cloud Sync Failed ({len(cloud_failures)})", sync_msg)
+        else:
             print(f"Cloud Sync Failed ({len(cloud_failures)})")
             print(sync_msg)
             for f in cloud_failures:
                 print(f"  - {f['repo']}: {f['error']} ({f['dest_id']})")
-        else:
-            show_toast_notification(f"[FAIL] Cloud Sync Failed ({len(cloud_failures)})", sync_msg)
+
+            # Run diagnostics for rclone failures when interactive
+            seen_dests = set()
+            for f in cloud_failures:
+                dest_id = f['dest_id']
+                if dest_id.startswith('rclone:') and dest_id not in seen_dests:
+                    seen_dests.add(dest_id)
+                    print(f"\nDiagnostics for {dest_id}:")
+                    diag_lines = diagnose_rclone_issues(dest_id)
+                    for line in diag_lines:
+                        print(line)
 
     if stale_syncs and not cloud_failures:
         # Only warn about stale syncs if there are no outright failures
@@ -868,11 +992,11 @@ Examples:
         else:
             sync_msg = f"{len(stale_syncs)} repos have stale cloud syncs"
 
-        if args.no_toast:
+        if use_toast:
+            show_toast_notification("[WARN] Cloud Sync Warning", sync_msg)
+        else:
             print("Cloud Sync Warning")
             print(sync_msg)
-        else:
-            show_toast_notification("[WARN] Cloud Sync Warning", sync_msg)
 
     # Verbose mode
     if args.verbose:
@@ -956,7 +1080,7 @@ Examples:
             print(f"OK: Last backup at {local_time}")
 
     # Determine exit code based on health status
-    has_issues = not is_healthy or recent_failures or cloud_failures or stale_syncs
+    has_issues = not is_healthy or recent_failures or cloud_failures or stale_syncs or schedule_stopped
     sys.exit(EXIT_HEALTH_WARNING if has_issues else EXIT_SUCCESS)
 
 

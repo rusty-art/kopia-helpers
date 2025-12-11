@@ -249,6 +249,18 @@ def run_backup_job(
                 print(f"[kopia] Warning: {warning}")
                 policy_warnings.append(warning)
 
+        # Handle dot-ignore files (e.g., .gitignore, .kopiaignore)
+        # These tell kopia to read ignore patterns from files in source directories
+        if 'dot-ignore' in policies and policies['dot-ignore']:
+            dot_ignore_cmd = ["policy", "set", source, "--config-file", config_file]
+            for filename in policies['dot-ignore']:
+                dot_ignore_cmd.extend(["--add-dot-ignore", filename])
+            success, _, stderr, _ = runner.run(dot_ignore_cmd, repo_config=repo_config, dry_run=dry_run)
+            if not success:
+                warning = f"Add dot-ignore failed for {source}: {stderr}"
+                print(f"[kopia] Warning: {warning}")
+                policy_warnings.append(warning)
+
         # 2. Create Snapshot
         print(f"[kopia] Creating snapshot for {source}...")
         snapshot_cmd = ["snapshot", "create", source, "--config-file", config_file]

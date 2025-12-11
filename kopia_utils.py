@@ -819,6 +819,119 @@ class KopiaSyncRunner:
             logging.error(f"Error checking rclone remotes: {e}")
             return False
 
+    @staticmethod
+    def _normalize_remote_path(path: str) -> str:
+        """Normalize remote path for comparison.
+
+        Strips trailing slashes, quotes, and handles case for consistent matching.
+        """
+        # Strip quotes that might wrap the path
+        path = path.strip('"\'')
+        # Strip trailing slashes
+        path = path.rstrip('/')
+        # On Windows, rclone remote names are case-insensitive
+        # But the path after : may be case-sensitive depending on remote
+        # For safety, we'll do case-insensitive compare on Windows
+        if sys.platform == "win32":
+            path = path.lower()
+        return path
+
+    def _path_in_cmdline(self, cmdline: str, remote_path: str) -> bool:
+        """Check if remote_path appears in rclone webdav serve command.
+
+        Kopia spawns rclone as: rclone -v serve webdav <remote-path> --addr ...
+        We look specifically for this pattern to avoid false matches.
+
+        Args:
+            cmdline: The command line string to search
+            remote_path: The normalized remote path to find
+
+        Returns:
+            True if path found in rclone serve webdav command
+        """
+        import re
+
+        # Escape special regex characters in the path
+        escaped_path = re.escape(remote_path)
+
+        # Pattern matches: serve webdav <path> (with optional quotes around path)
+        # The path must be followed by whitespace or end of string (not more path segments)
+        # Format: rclone [-v] serve webdav <remote:path> [--addr ...]
+        if sys.platform == "win32":
+            # Windows: only double quotes, case-insensitive
+            pattern = rf'serve\s+webdav\s+"?({escaped_path})"?(?:\s|$)'
+            flags = re.IGNORECASE
+        else:
+            # Linux/Unix: single or double quotes, case-sensitive
+            pattern = rf'serve\s+webdav\s+["\']?({escaped_path})["\']?(?:\s|$)'
+            flags = 0
+
+        return bool(re.search(pattern, cmdline, flags))
+
+    def is_sync_already_running(self, dest_config: Dict[str, Any]) -> Tuple[bool, str]:
+        """Check if a sync is already running for this destination.
+
+        For rclone backends, checks for rclone processes with matching remote path.
+        Uses normalized path matching to distinguish between different sync jobs.
+
+        Args:
+            dest_config: Destination configuration dict
+
+        Returns:
+            (is_running, description) tuple
+        """
+        dest_type = dest_config.get('type', '')
+
+        if dest_type != 'rclone':
+            # Only check for rclone backends for now
+            return False, ""
+
+        remote_path = dest_config.get('remote-path', '')
+        if not remote_path:
+            return False, ""
+
+        # Normalize for comparison
+        normalized_path = self._normalize_remote_path(remote_path)
+
+        try:
+            creation_flags = 0x08000000 if sys.platform == "win32" else 0
+
+            if sys.platform == "win32":
+                # Use PowerShell Get-CimInstance (WMIC is deprecated in Windows 11)
+                result = subprocess.run(
+                    ["powershell", "-Command",
+                     "Get-CimInstance Win32_Process -Filter \"Name='rclone.exe'\" | Select-Object -ExpandProperty CommandLine"],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    creationflags=creation_flags
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.strip().split('\n'):
+                        # Look for rclone serving this exact remote path
+                        if line.strip() and 'serve' in line.lower():
+                            if self._path_in_cmdline(line, normalized_path):
+                                return True, f"rclone already syncing to {remote_path}"
+            else:
+                # Unix: use ps with full command
+                result = subprocess.run(
+                    ["ps", "aux"],
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8'
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.strip().split('\n'):
+                        if 'rclone' in line and 'serve' in line.lower():
+                            if self._path_in_cmdline(line, normalized_path):
+                                return True, f"rclone already syncing to {remote_path}"
+
+            return False, ""
+
+        except Exception as e:
+            logging.debug(f"Error checking for running syncs: {e}")
+            return False, ""
+
     def build_sync_command(
         self,
         dest_config: Dict[str, Any],
@@ -881,10 +994,16 @@ class KopiaSyncRunner:
         if dry_run:
             cmd.append("--dry-run")
 
-        # Append extra-args at the end (allows overriding defaults)
-        extra_args = dest_config.get('extra-args', [])
-        if extra_args:
-            cmd.extend(extra_args)
+        # Handle sync-args based on backend type
+        # For rclone: args are passed via --rclone-args=<arg> (e.g., --tpslimit for rate limiting)
+        # For other backends: args go directly to kopia sync-to command
+        sync_args = dest_config.get('sync-args', [])
+        if sync_args:
+            if dest_type == 'rclone':
+                for arg in sync_args:
+                    cmd.append(f"--rclone-args={arg}")
+            else:
+                cmd.extend(sync_args)
 
         return cmd, None
 
@@ -909,6 +1028,11 @@ class KopiaSyncRunner:
             (success, error_message) tuple
         """
         dest_type = dest_config.get('type', 'unknown')
+
+        # Check if sync is already running for this destination
+        is_running, running_msg = self.is_sync_already_running(dest_config)
+        if is_running:
+            return False, f"Skipped: {running_msg} (letting previous sync finish)"
 
         # For rclone backend, verify remote is configured
         if dest_type == 'rclone':

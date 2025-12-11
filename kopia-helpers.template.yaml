@@ -68,6 +68,12 @@ repositories:
       #   - "*.pyc"         # Python bytecode files
       #   - "*.tmp"         # Temporary files
 
+      # Automatically read .gitignore files in source directories
+      # This tells kopia to respect existing .gitignore patterns
+      dot-ignore:
+        - ".gitignore"
+        - ".kopiaignore"
+
   # Repository with cloud sync example
   # Uses kopia's built-in sync-to command (handles sharding properly)
   #
@@ -95,6 +101,11 @@ repositories:
   #     - type: rclone
   #       remote-path: onedrive:mybackups/kopia
   #       interval: 60m
+  #       # sync-args: args passed to backend (rclone here)
+  #       # OneDrive throttles at ~10,000 requests/10min (~17 TPS) - use tpslimit to avoid HTTP 429
+  #       sync-args:
+  #         - "--tpslimit=8"        # Limit to 8 transactions/second (safe margin)
+  #         - "--tpslimit-burst=8"  # Allow small bursts
   #
   #     # Local NAS / network share
   #     - type: filesystem
@@ -105,4 +116,4 @@ repositories:
   #     - type: s3
   #       bucket: my-backup-bucket
   #       interval: 120m
-  #       extra-args: ["--access-key=AKIA...", "--secret-access-key=..."]
+  #       sync-args: ["--access-key=AKIA...", "--secret-access-key=..."]

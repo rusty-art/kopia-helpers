@@ -74,6 +74,31 @@ repositories:
         - ".gitignore"
         - ".kopiaignore"
 
+  # Repository with sync-from example (e.g., NAS/network share to local)
+  # sync-from runs BEFORE backup to prepare source directories
+  # Uses rclone to copy files from remote location to local before kopia backup
+  #
+  # - name: nas-backup
+  #   repo_destination: C:/kopia-cache/nas-docs
+  #   repo_config: C:/kopia-cache/nas-docs/repository.config
+  #   repo_password: your_password_here
+  #
+  #   sources:
+  #     - C:/Users/username/nas-docs-local
+  #
+  #   # Pre-backup sync: copy from NAS to local before backup
+  #   sync-from:
+  #     - type: rclone
+  #       source: //nas/shared/documents
+  #       destination: C:/Users/username/nas-docs-local
+  #       # Optional: extra rclone args
+  #       # sync-args:
+  #       #   - "--exclude=*.tmp"
+  #
+  #   policies:
+  #     keep-latest: 100
+  #     snapshot-interval: 10m
+
   # Repository with cloud sync example
   # Uses kopia's built-in sync-to command (handles sharding properly)
   #

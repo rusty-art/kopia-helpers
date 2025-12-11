@@ -4,6 +4,7 @@
 
 # User config that might contain passwords
 kopia-helpers.yaml
+kopia-helpers-backup.yaml
 
 # Python
 __pycache__/

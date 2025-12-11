@@ -29,6 +29,7 @@ import os
 import sys
 import logging
 import argparse
+import subprocess
 import kopia_utils as utils
 from typing import Dict, Any, List, Tuple, Optional
 import json
@@ -60,11 +61,17 @@ def preflight_checks(config: Dict[str, Any], runner: utils.KopiaRunner) -> Tuple
     errors = []
     warnings = []
 
-    # Check if any repo has sync-to destinations using rclone
+    # Check if any repo has sync-to or sync-from using rclone
     needs_rclone = False
     for repo in config.get('repositories', []):
+        # Check sync-to destinations
         for dest in repo.get('sync-to', []):
             if dest.get('type') == 'rclone':
+                needs_rclone = True
+                break
+        # Check sync-from sources
+        for src in repo.get('sync-from', []):
+            if src.get('type', 'rclone') == 'rclone':
                 needs_rclone = True
                 break
         if needs_rclone:
@@ -286,6 +293,12 @@ def run_backup_job(
         print(f"Sync destinations: {', '.join(sync_dests)}")
     print()
 
+    # 0. Sync from remote sources (e.g., WSL -> Windows) before backup
+    if repo_config.get('sync-from'):
+        if not sync_from_sources(repo_config, dry_run=dry_run):
+            print(f"[WARN] sync-from had errors, continuing with backup...")
+            # Don't abort - try to backup whatever is there
+
     if not ensure_repository_connected(runner, repo_config, dry_run):
         print(f"[ERROR] Skipping {repo_name} due to connection failure.")
         return False
@@ -409,6 +422,84 @@ def run_backup_job(
             print(f"  Cloud sync failed")
 
     return backup_success
+
+
+def sync_from_sources(repo_config: Dict[str, Any], dry_run: bool = False) -> bool:
+    """Sync from remote sources to local destinations before backup.
+
+    Runs rclone sync for each configured sync-from entry. This prepares
+    source directories (e.g., copying from WSL to Windows) before kopia runs.
+
+    Args:
+        repo_config: Repository configuration dict
+        dry_run: If True, simulate without making changes
+
+    Returns:
+        True if all syncs succeeded (or none configured), False if any failed.
+    """
+    sync_sources = repo_config.get('sync-from', [])
+    if not sync_sources:
+        return True  # Nothing to do
+
+    repo_name = repo_config['name']
+    all_success = True
+
+    for sync_config in sync_sources:
+        sync_type = sync_config.get('type', 'rclone')
+        source = sync_config.get('source', '')
+        destination = sync_config.get('destination', '')
+
+        if not source or not destination:
+            print(f"[sync-from] ERROR: Missing source or destination in sync-from config")
+            all_success = False
+            continue
+
+        if sync_type != 'rclone':
+            print(f"[sync-from] ERROR: Unsupported sync type '{sync_type}' (only 'rclone' supported)")
+            all_success = False
+            continue
+
+        # Build rclone sync command
+        cmd = [utils.RCLONE_EXE, "sync", source, destination]
+
+        # Add any extra args from config
+        sync_args = sync_config.get('sync-args', [])
+        if sync_args:
+            cmd.extend(sync_args)
+
+        # Add progress flag unless in dry-run mode
+        if not dry_run:
+            cmd.append("--progress")
+
+        print(f"\n[sync-from] Syncing {source} -> {destination}...")
+
+        if dry_run:
+            print(f"[sync-from] DRY RUN: Would run: {' '.join(cmd)}")
+            continue
+
+        try:
+            # Run rclone sync
+            result = subprocess.run(
+                cmd,
+                capture_output=False,  # Show progress output
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            )
+
+            if result.returncode == 0:
+                print(f"[sync-from] Sync complete: {source} -> {destination}")
+            else:
+                print(f"[sync-from] ERROR: rclone sync failed with exit code {result.returncode}")
+                all_success = False
+
+        except FileNotFoundError:
+            print(f"[sync-from] ERROR: rclone not found. Please install rclone.")
+            all_success = False
+        except Exception as e:
+            print(f"[sync-from] ERROR: {e}")
+            all_success = False
+
+    return all_success
 
 
 def parse_interval(interval_str: str) -> int:

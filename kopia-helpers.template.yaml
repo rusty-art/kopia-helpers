@@ -78,6 +78,10 @@ repositories:
   # sync-from runs BEFORE backup to prepare source directories
   # Uses rclone to copy files from remote location to local before kopia backup
   #
+  # NOTE: sync-from only reads dot-ignore files (.gitignore, .kopiaignore) from the
+  # TOP-LEVEL source directory. Unlike kopia/git, rclone doesn't support recursive
+  # .gitignore parsing. For full exclusion control, use explicit sync-args instead.
+  #
   # - name: nas-backup
   #   repo_destination: C:/kopia-cache/nas-docs
   #   repo_config: C:/kopia-cache/nas-docs/repository.config

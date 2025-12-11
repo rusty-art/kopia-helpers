@@ -291,7 +291,7 @@ def get_config_file_path(repo_config: Dict[str, Any]) -> str:
 # Valid field names for repository config (for validation)
 VALID_REPO_FIELDS = {
     'name', 'repo_destination', 'repo_config', 'repo_password',
-    'sources', 'policies', 'sync-to',
+    'sources', 'policies', 'sync-from', 'sync-to',
 }
 
 REQUIRED_REPO_FIELDS = {'name', 'repo_destination', 'repo_config', 'sources'}

@@ -30,12 +30,80 @@ import sys
 import logging
 import argparse
 import subprocess
+import signal
+import atexit
 import kopia_utils as utils
 from typing import Dict, Any, List, Tuple, Optional
 import json
 import re
 
 # Logging configured in main() after argument parsing
+
+# Track child processes for cleanup on Ctrl-C
+_child_processes: List[subprocess.Popen] = []
+
+
+def kill_orphaned_rclone_processes():
+    """Kill orphaned rclone 'serve webdav' processes.
+
+    These may have been spawned by kopia sync-to and left running after
+    kopia exits (especially on error).
+    """
+    try:
+        if sys.platform == 'win32':
+            # Find rclone processes serving webdav
+            result = subprocess.run(
+                ["powershell", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"Name='rclone.exe'\" | "
+                 "Where-Object { $_.CommandLine -like '*serve*webdav*' } | "
+                 "Select-Object ProcessId"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().split('\n'):
+                    line = line.strip()
+                    if line.isdigit():
+                        pid = int(line)
+                        logging.info(f"Killing orphaned rclone process {pid}")
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                       capture_output=True,
+                                       creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception as e:
+        logging.debug(f"Error cleaning up rclone processes: {e}")
+
+
+def cleanup_child_processes(kill_rclone: bool = False):
+    """Kill any child processes (kopia) that may still be running.
+
+    Args:
+        kill_rclone: If True, also kill orphaned rclone webdav processes.
+                    Only set True on Ctrl-C interrupt, not normal exit.
+    """
+    for proc in _child_processes:
+        try:
+            if proc.poll() is None:  # Still running
+                logging.debug(f"Terminating child process {proc.pid}")
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        except Exception as e:
+            logging.debug(f"Error terminating process: {e}")
+    _child_processes.clear()
+
+    # Only kill rclone processes on interrupt, not normal exit
+    # (rclone may still be legitimately syncing in the background)
+    if kill_rclone:
+        kill_orphaned_rclone_processes()
+
+
+def signal_handler(signum, frame):
+    """Handle Ctrl-C by cleaning up child processes."""
+    print("\n[INTERRUPTED] Cleaning up...")
+    cleanup_child_processes(kill_rclone=True)  # Kill rclone only on interrupt
+    sys.exit(130)  # Standard exit code for Ctrl-C
 
 # Default (can be overridden in kopia-helpers.yaml under 'settings')
 DEFAULT_BACKUP_INTERVAL_MINUTES = 15
@@ -467,6 +535,16 @@ def sync_from_sources(repo_config: Dict[str, Any], dry_run: bool = False) -> boo
         if sync_args:
             cmd.extend(sync_args)
 
+        # Add dot-ignore files as --exclude-from (respects .gitignore etc.)
+        policies = repo_config.get('policies', {})
+        dot_ignore_patterns = policies.get('dot-ignore', [])
+        for ignore_file in dot_ignore_patterns:
+            # Construct path to ignore file in source directory
+            ignore_path = os.path.join(source, ignore_file)
+            if os.path.exists(ignore_path):
+                cmd.append(f"--exclude-from={ignore_path}")
+                print(f"[sync-from] Using {ignore_file} for exclusions")
+
         # Add progress flag unless in dry-run mode
         if not dry_run:
             cmd.append("--progress")
@@ -586,17 +664,27 @@ def sync_to_cloud(repo_config: Dict[str, Any], runner: utils.KopiaRunner, schedu
             dry_run=dry_run
         )
 
-        # Update status file for health check
-        utils.update_cloud_sync_status(
-            repo_name, dest_id, success=success,
-            error=error if not success else None
-        )
+        # Check if this was a skip (not a real failure)
+        was_skipped = error and error.startswith("Skipped:")
+
+        # Update status file for health check (but not for skips - previous sync is still running)
+        if not was_skipped:
+            utils.update_cloud_sync_status(
+                repo_name, dest_id, success=success,
+                error=error if not success else None
+            )
 
         if success:
             print(f"[sync] Sync to {dest_id} complete.")
+        elif was_skipped:
+            # Skipped because another sync is running - this is a warning, not failure
+            print(f"[sync] {error}")
         else:
             print(f"[sync] ERROR syncing to {dest_id}: {error}")
             all_success = False
+            # Clean up orphaned rclone processes if this was an rclone sync failure
+            if dest_config.get('type') == 'rclone':
+                kill_orphaned_rclone_processes()
 
     return all_success
 
@@ -642,6 +730,14 @@ def main():
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[logging.StreamHandler(sys.stdout)]
     )
+
+    # Register signal handler for clean shutdown on Ctrl-C
+    signal.signal(signal.SIGINT, signal_handler)
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, signal_handler)
+
+    # Also register atexit to clean up on normal exit or unhandled exceptions
+    atexit.register(cleanup_child_processes)
 
     if not utils.is_admin():
         if args.dry_run or args.no_elevation:

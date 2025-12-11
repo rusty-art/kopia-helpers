@@ -44,18 +44,20 @@ _child_processes: List[subprocess.Popen] = []
 
 
 def kill_orphaned_rclone_processes():
-    """Kill orphaned rclone 'serve webdav' processes.
+    """Kill orphaned rclone 'serve webdav' processes spawned by kopia.
 
-    These may have been spawned by kopia sync-to and left running after
-    kopia exits (especially on error).
+    Kopia spawns rclone with temp directories named 'kopia-rclone*'.
+    We only kill processes matching this pattern to avoid killing
+    unrelated rclone servers the user may be running.
     """
     try:
         if sys.platform == 'win32':
-            # Find rclone processes serving webdav
+            # Find rclone processes spawned by kopia (have kopia-rclone in temp path)
             result = subprocess.run(
                 ["powershell", "-Command",
                  "Get-CimInstance Win32_Process -Filter \"Name='rclone.exe'\" | "
-                 "Where-Object { $_.CommandLine -like '*serve*webdav*' } | "
+                 "Where-Object { $_.CommandLine -like '*serve*webdav*' -and "
+                 "$_.CommandLine -like '*kopia-rclone*' } | "
                  "Select-Object ProcessId"],
                 capture_output=True, text=True, timeout=10,
                 creationflags=subprocess.CREATE_NO_WINDOW
@@ -65,7 +67,7 @@ def kill_orphaned_rclone_processes():
                     line = line.strip()
                     if line.isdigit():
                         pid = int(line)
-                        logging.info(f"Killing orphaned rclone process {pid}")
+                        logging.info(f"Killing orphaned kopia-rclone process {pid}")
                         subprocess.run(["taskkill", "/F", "/PID", str(pid)],
                                        capture_output=True,
                                        creationflags=subprocess.CREATE_NO_WINDOW)
@@ -682,9 +684,11 @@ def sync_to_cloud(repo_config: Dict[str, Any], runner: utils.KopiaRunner, schedu
         else:
             print(f"[sync] ERROR syncing to {dest_id}: {error}")
             all_success = False
-            # Clean up orphaned rclone processes if this was an rclone sync failure
-            if dest_config.get('type') == 'rclone':
-                kill_orphaned_rclone_processes()
+
+        # Clean up orphaned rclone webdav processes after any rclone sync
+        # (kopia spawns rclone but doesn't always clean it up on exit)
+        if dest_config.get('type') == 'rclone' and not was_skipped:
+            kill_orphaned_rclone_processes()
 
     return all_success
 

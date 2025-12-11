@@ -220,6 +220,74 @@ To see all available options for a backend:
 kopia repository sync-to <type> --help
 ```
 
+### rclone process cleanup
+
+When using the rclone backend, kopia spawns `rclone serve webdav` processes to communicate with cloud storage. These processes are sometimes left running after kopia exits. The backup script automatically cleans up orphaned kopia-rclone processes:
+
+- After each successful or failed rclone sync
+- On Ctrl-C interrupt
+- Only kills processes with `kopia-rclone` in their command line (won't affect other rclone servers you may be running)
+
+### Concurrent sync protection
+
+If a sync is already running to a destination (e.g., from a previous backup run), the script will skip that sync rather than starting a conflicting one. This prevents issues when:
+- You run the script manually while a scheduled task is already running
+- A slow sync from the previous run is still in progress
+
+## Syncing from Remote Sources (sync-from)
+
+You can pull files from a remote location *before* kopia creates a snapshot. This is useful for:
+- Backing up WSL/Linux files to a Windows-accessible location
+- Pulling files from a NAS before backup
+- Creating a local copy of remote files for faster kopia access
+
+### Configuration
+
+Add a `sync-from` list to your repository:
+
+```yaml
+repositories:
+  - name: linux-backup
+    repo_destination: C:/kopia-cache/linux
+    repo_config: C:/kopia-cache/linux/repository.config
+
+    sources:
+      - C:/local-copy/linux-projects  # Kopia backs up this local copy
+
+    # Pull from remote BEFORE backup
+    sync-from:
+      - type: rclone
+        source: //wsl.localhost/Ubuntu/home/user/projects
+        destination: C:/local-copy/linux-projects
+        sync-args:
+          - "--ignore-case-sync"  # Handle case-sensitive filenames
+```
+
+### How it works
+
+1. Before kopia runs, `rclone sync` copies from `source` to `destination`
+2. Kopia then backs up the `destination` directory (listed in `sources`)
+3. This gives you a local Windows copy plus versioned kopia backups
+
+### sync-from options
+
+| Field | Description |
+|-------|-------------|
+| `type` | Currently only `rclone` is supported |
+| `source` | Remote path (rclone remote or UNC path) |
+| `destination` | Local path to sync to |
+| `sync-args` | List of extra rclone arguments |
+
+### Respecting ignore files
+
+sync-from respects `.kopiaignore` files in the **top-level** source directory. Due to rclone limitations, nested ignore files are not parsed recursively (unlike kopia/git).
+
+```yaml
+policies:
+  dot-ignore:
+    - ".kopiaignore"  # Also used by sync-from for exclusions
+```
+
 ## Finding Files
 
 Search for files across all snapshots using `find -name` style patterns:

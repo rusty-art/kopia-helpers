@@ -443,19 +443,23 @@ def show_detailed_status(runner: utils.KopiaRunner, repo_config: Dict[str, Any],
                                             parsed = parse_diff_line(line)
                                             if not parsed:
                                                 continue
-                                            
+
                                             change_type, fpath, formatted = parsed
                                             agg_dir = match_aggregated_dir(fpath)
-                                            
-                                            # Track in total counts
+
+                                            # Track in total counts (always count, even after truncation)
                                             total_counts[change_type] += 1
-                                            
+
+                                            # Skip printing if already truncated (but keep counting)
+                                            if truncated:
+                                                continue
+
                                             if agg_dir:
                                                 # If directory changed, print previous summary
                                                 if current_agg_dir and current_agg_dir != agg_dir:
                                                     print_agg_summary(current_agg_dir, agg_counts)
                                                     agg_counts = {'added': 0, 'changed': 0, 'removed': 0}
-                                                
+
                                                 current_agg_dir = agg_dir
                                                 agg_counts[change_type] += 1
                                             else:
@@ -465,26 +469,26 @@ def show_detailed_status(runner: utils.KopiaRunner, repo_config: Dict[str, Any],
                                                     print_agg_summary(current_agg_dir, agg_counts)
                                                     current_agg_dir = None
                                                     agg_counts = {'added': 0, 'changed': 0, 'removed': 0}
-                                                
+
                                                 if regular_count < max_files:
                                                     print(formatted)
                                                     regular_count += 1
                                                 else:
+                                                    # Stop printing but continue counting
                                                     truncated = True
-                                                    process.terminate()
-                                                    break
-                                    
+
                                     # Clean up
-                                    process.wait(timeout=1)
-                                    
+                                    process.wait(timeout=5)
+
                                     # Print any remaining aggregated summary
-                                    if current_agg_dir:
+                                    if current_agg_dir and not truncated:
                                         print_agg_summary(current_agg_dir, agg_counts)
                                     
                                     if truncated:
                                         print(f"      ... (output truncated after {max_files} files)")
-                                    elif sum(total_counts.values()) > 0:
-                                        # Print total summary at the end (only if not truncated)
+
+                                    # Always print total summary if there were changes
+                                    if sum(total_counts.values()) > 0:
                                         summary = f"added {total_counts['added']}, changed {total_counts['changed']}, removed {total_counts['removed']}"
                                         print(f"    Total: {summary}")
                                         sys.stdout.flush()

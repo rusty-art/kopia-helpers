@@ -30,7 +30,9 @@ import sys
 import logging
 import argparse
 import kopia_utils as utils
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
+import json
+import re
 
 # Logging configured in main() after argument parsing
 
@@ -108,6 +110,96 @@ def preflight_checks(config: Dict[str, Any], runner: utils.KopiaRunner) -> Tuple
     return len(errors) == 0, errors
 
 
+def get_snapshot_summary(
+    runner: utils.KopiaRunner,
+    repo_config: Dict[str, Any],
+    source: str,
+    config_file: str
+) -> Optional[Dict[str, Any]]:
+    """Get summary of the latest snapshot compared to the previous one.
+
+    Args:
+        runner: KopiaRunner instance
+        repo_config: Repository configuration dict
+        source: Source path that was backed up
+        config_file: Path to kopia config file
+
+    Returns:
+        Dict with summary info or None if unavailable:
+        {
+            'time': '2025-12-11 13:39:03 +1100',
+            'total_files': 2825,
+            'total_size_mb': 747.69,
+            'added': 2,
+            'changed': 1,
+            'removed': 3
+        }
+    """
+    # Get recent snapshots for this source
+    success, stdout, _, _ = runner.run(
+        ["snapshot", "list", source, "--config-file", config_file, "--json"],
+        repo_config=repo_config, readonly=True
+    )
+
+    if not success or not stdout.strip():
+        return None
+
+    try:
+        snapshots = json.loads(stdout)
+        if not snapshots:
+            return None
+
+        latest = snapshots[-1]
+
+        # Get snapshot info
+        time_str = latest.get('startTime', '')
+        time_display = utils.format_timestamp_local(time_str) if time_str else 'unknown'
+
+        root_entry = latest.get('rootEntry', {})
+        summ = root_entry.get('summ', {})
+        total_files = summ.get('files', 0)
+        total_size = summ.get('size', 0)
+        total_size_mb = total_size / (1024 * 1024)
+
+        result = {
+            'time': time_display,
+            'total_files': total_files,
+            'total_size_mb': total_size_mb,
+            'added': 0,
+            'changed': 0,
+            'removed': 0
+        }
+
+        # If we have at least 2 snapshots, get diff
+        if len(snapshots) >= 2:
+            prev_id = snapshots[-2].get('id')
+            curr_id = latest.get('id')
+
+            if prev_id and curr_id:
+                success, diff_stdout, _, _ = runner.run(
+                    ["diff", "--no-progress", prev_id, curr_id, "--config-file", config_file],
+                    repo_config=repo_config, readonly=True
+                )
+
+                if success and diff_stdout:
+                    for line in diff_stdout.strip().split('\n'):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if line.startswith('changed '):
+                            result['changed'] += 1
+                        elif line.startswith('added file '):
+                            result['added'] += 1
+                        elif line.startswith('removed file '):
+                            result['removed'] += 1
+
+        return result
+
+    except (json.JSONDecodeError, KeyError, IndexError) as e:
+        logging.debug(f"Error getting snapshot summary: {e}")
+        return None
+
+
 def ensure_repository_connected(runner: utils.KopiaRunner, repo_config: Dict[str, Any], dry_run: bool = False) -> bool:
     """Connects to the repository if not already connected."""
     repo_path = repo_config['repo_destination']
@@ -165,7 +257,8 @@ def run_backup_job(
     runner: utils.KopiaRunner,
     repo_config: Dict[str, Any],
     scheduled: bool = False,
-    dry_run: bool = False
+    dry_run: bool = False,
+    force: bool = False
 ) -> bool:
     """Runs the backup for a single repository configuration.
 
@@ -174,6 +267,7 @@ def run_backup_job(
         repo_config: Repository configuration dict
         scheduled: If True, running from Task Scheduler (quiet cloud sync)
         dry_run: If True, simulate without making changes
+        force: If True, force sync regardless of interval
 
     Returns:
         True if backup (and cloud sync if configured) succeeded.
@@ -273,10 +367,29 @@ def run_backup_job(
         else:
             print(f"[kopia] Snapshot complete for {source}")
 
+            # Show snapshot summary (time, files, size, changes)
+            if not dry_run:
+                summary = get_snapshot_summary(runner, repo_config, source, config_file)
+                if summary:
+                    print(f"       Time: {summary['time']}")
+                    print(f"       Total Files: {summary['total_files']}")
+                    print(f"       Total Size: {summary['total_size_mb']:.2f} MB")
+                    changes = []
+                    if summary['changed'] > 0:
+                        changes.append(f"{summary['changed']} changed")
+                    if summary['added'] > 0:
+                        changes.append(f"{summary['added']} added")
+                    if summary['removed'] > 0:
+                        changes.append(f"{summary['removed']} removed")
+                    if changes:
+                        print(f"       Files: {', '.join(changes)}")
+                    else:
+                        print(f"       Files: no changes (or first snapshot)")
+
     # 3. Sync to destinations if configured (sync-to is set)
     cloud_success = True
     if has_cloud:
-        cloud_success = sync_to_cloud(repo_config, runner, scheduled=scheduled, dry_run=dry_run)
+        cloud_success = sync_to_cloud(repo_config, runner, scheduled=scheduled, dry_run=dry_run, force_sync=force)
 
     # Summarize results for this repo
     backup_success = len(snapshot_errors) == 0 and cloud_success
@@ -313,7 +426,7 @@ def parse_interval(interval_str: str) -> int:
         return int(interval_str)  # assume seconds
 
 
-def sync_to_cloud(repo_config: Dict[str, Any], runner: utils.KopiaRunner, scheduled: bool = False, dry_run: bool = False) -> bool:
+def sync_to_cloud(repo_config: Dict[str, Any], runner: utils.KopiaRunner, scheduled: bool = False, dry_run: bool = False, force_sync: bool = False) -> bool:
     """Sync local repository to all configured destinations using kopia repository sync-to.
 
     Args:
@@ -321,6 +434,7 @@ def sync_to_cloud(repo_config: Dict[str, Any], runner: utils.KopiaRunner, schedu
         runner: KopiaRunner instance (for password lookup)
         scheduled: If True, quiet mode (no progress output)
         dry_run: If True, simulate without making changes
+        force_sync: If True, ignore interval and sync immediately
 
     Returns:
         True if all syncs succeeded (or were skipped), False if any failed.
@@ -348,7 +462,8 @@ def sync_to_cloud(repo_config: Dict[str, Any], runner: utils.KopiaRunner, schedu
         interval_str = dest_config.get('interval', '60m')  # default 1 hour
         interval_seconds = parse_interval(interval_str)
 
-        # Check if we should skip based on last sync time for this destination
+        # Get last sync time for display and interval checking
+        elapsed_minutes = None
         dest_status = utils.get_sync_status_for_destination(repo_name, dest_id)
         if dest_status and dest_status.get('success', False):
             last_sync_str = dest_status.get('last_sync')
@@ -357,14 +472,21 @@ def sync_to_cloud(repo_config: Dict[str, Any], runner: utils.KopiaRunner, schedu
                     last_sync = datetime.fromisoformat(last_sync_str.replace('Z', '+00:00'))
                     now = datetime.now(timezone.utc)
                     elapsed = (now - last_sync).total_seconds()
-                    if elapsed < interval_seconds:
+                    elapsed_minutes = int(elapsed / 60)
+
+                    # Check if we should skip based on interval (unless force_sync)
+                    if not force_sync and elapsed < interval_seconds:
                         remaining = int((interval_seconds - elapsed) / 60)
-                        print(f"[sync] Skipping {dest_id} (last sync {int(elapsed/60)}m ago, next in ~{remaining}m)")
+                        print(f"[sync] Skipping {dest_id} (last sync {elapsed_minutes}m ago, next in ~{remaining}m)")
                         continue  # Skip this destination, check next
                 except (ValueError, TypeError):
                     pass  # Can't parse, proceed with sync
 
-        print(f"\n[sync] Syncing to {dest_id}...")
+        # Build sync message with optional last sync info
+        sync_msg = f"\n[sync] Syncing to {dest_id}..."
+        if elapsed_minutes is not None:
+            sync_msg = f"\n[sync] Syncing to {dest_id} (last sync {elapsed_minutes}m ago)..."
+        print(sync_msg)
         success, error = sync_runner.sync(
             dest_config=dest_config,
             config_file=config_file,
@@ -416,6 +538,8 @@ def main():
                         help="Comma-separated list of repo names to backup now (default: all repos)")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="Skip pre-flight validation checks (not recommended)")
+    parser.add_argument("--force", action="store_true",
+                        help="Force sync even if interval hasn't elapsed (snapshots still respect kopia's policy)")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Set logging level (default: INFO)")
@@ -497,7 +621,7 @@ def main():
 
         # Skip backups if only --register --maintenance was requested
         if not args.register:
-            backup_success = run_backup_job(runner, repo, scheduled=args.scheduled, dry_run=args.dry_run)
+            backup_success = run_backup_job(runner, repo, scheduled=args.scheduled, dry_run=args.dry_run, force=args.force)
             if backup_success:
                 successful_repos.append(repo_name)
             else:
